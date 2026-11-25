@@ -1,6 +1,6 @@
 BasicInfo:
-  Title                   : 3Danmu
-  ProductCode             : CTR-P-3DAN
+  Title                   : 3DanKina
+  ProductCode             : CTR-P-3DKN
   Logo                    : Homebrew
 
 RomFs:
@@ -13,11 +13,11 @@ RomFs:
 
 TitleInfo:
   Category                : Application
-  # 【UniqueId 故意不改】它是这个应用在系统里的身份证。改了的话,
-  # 新装的会被当成**另一个应用**,旧的那个还赖在主菜单里不走,
-  # 得手动去数据管理里删。名字里的品牌痕迹改掉就够了,
-  # 这个数字用户看不见。
-  UniqueId                : 0xB1B11
+  # Permanent fork identity: 000400000F8DA100, distinct from upstream
+  # 000400000B1B1100. Keep this UniqueId for every future fork release so
+  # installations update 3Danmu Kina while upstream remains a separate title.
+  # See cia/IDENTITY.md. Never randomize this value between builds.
+  UniqueId                : 0xF8DA1
 
 Option:
   UseOnSD                 : true

@@ -17,7 +17,9 @@ DATA		:=	data
 INCLUDES	:=	source
 ROMFS		:=	romfs
 
-APP_TITLE       := 3Danmu
+APP_TITLE       := 3Danmu Kina
+# Installation metadata version (1.0.0); feature version is in main.c.
+CIA_VERSION     := 1024
 # 【不要在这里写版本号】这一行会进 SMDH,显示在 HOME 菜单和暂停界面上,
 # 那是给用户看"这是什么程序",不是看版本的地方。
 # 版本号在 source/main.c 的 APP_VERSION,设置页和打包脚本都从那里取。
@@ -142,7 +144,7 @@ cia: all
 		echo "只想要 .3dsx 的话不用管这个,make already done。"; exit 1; }
 	@command -v makerom >/dev/null || { echo "缺 makerom,见 README"; exit 1; }
 	@bannertool makebanner -i cia/banner.png -a cia/audio.wav -o $(BUILD)/banner.bnr > /dev/null
-	@makerom -f cia -o $(TARGET).cia -elf $(TARGET).elf \
+	@makerom -f cia -o $(TARGET).cia -elf $(TARGET).elf -ver $(CIA_VERSION) \
 		-rsf cia/3danmu.rsf \
 		-DAPP_ROMFS=$(CURDIR)/$(ROMFS) \
 		-banner $(BUILD)/banner.bnr -icon $(OUTPUT).smdh \

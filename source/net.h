@@ -38,6 +38,11 @@ void net_cancel_img(void);
 /* 掐断在途的视频流连接(不影响图片/API)。播放器退出前调,
  * 免得下载线程在半死连接上把 join 拖满超时 */
 void net_cancel_streams(void);
+/* Cancel short API requests only; keep a playing video's stream alive while
+ * dismissing an action/loading modal. Safe to repeat while its worker drains. */
+void net_cancel_requests(void);
+/* Monotonic cancellation generation for interruptible pre-request waits. */
+uint32_t net_request_generation(void);
 
 /* 开始退出:掐断**所有**在途请求(含视频流),并拒绝之后的任何新请求。
  * 给 APT 的 ONEXIT 钩子用 —— 不这么做,主线程卡在同步请求里时
@@ -54,6 +59,11 @@ int net_post_json(const char *url, const char *json, HttpResponse *res);
  * 3DS 上手工拼 body + httpcAddPostDataRaw 会直接请求失败 */
 int net_post_fields(const char *url, const char *const *keys,
                     const char *const *vals, int n, HttpResponse *res);
+/* State-changing operations: exactly one attempt under the request lock.
+ * No redirect following, no service-reset retry. Failure may mean the server
+ * applied the write. Response body is capped at 1 MiB, body wait at 20 s. */
+int net_post_fields_once(const char *url, const char *const *keys,
+                         const char *const *vals, int n, HttpResponse *res);
 /* 最近一次请求失败的步骤:2=OpenContext 3=BeginRequest 4=状态码 6=下载 */
 extern int g_net_last_step;
 /* 最近一次请求跟随的重定向次数(排查「每张图为何要几百毫秒」) */
@@ -72,7 +82,7 @@ const char *net_last_set_cookie(void);
 void        net_absorb_set_cookie(const char *hdr);
 /* 当前会随请求发出的 Cookie 头内容(不含 "Cookie: " 前缀) */
 void        net_cookie_header(char *out, size_t outlen);
-int         net_cookies_load(void);                    /* sdmc:/3ds/3danmu/cookies.txt */
+int         net_cookies_load(void);                    /* sdmc:/3ds/3danmu-kina/cookies.txt */
 /* who 只用于 trace.log,方便事后认领「是谁把文件写成这样的」。
  * _from 带保险:内存里没 SESSDATA 而盘上有时拒绝写(防止把登录态刷没)。
  * _force 不带,只给注销用 —— 那是**故意**要清掉。 */

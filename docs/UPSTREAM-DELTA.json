@@ -1,0 +1,317 @@
+{
+  "upstream_commit": "ebbe757605135bace131651cc563c8a47cdf7a6a",
+  "files": [
+    {
+      "path": "DEVELOPING.md",
+      "change": "modified"
+    },
+    {
+      "path": "Makefile",
+      "change": "modified"
+    },
+    {
+      "path": "README.md",
+      "change": "modified"
+    },
+    {
+      "path": "THIRD-PARTY-NOTICES.md",
+      "change": "modified"
+    },
+    {
+      "path": "build-ffmpeg-3ds.sh",
+      "change": "modified"
+    },
+    {
+      "path": "cia/3danmu.rsf",
+      "change": "modified"
+    },
+    {
+      "path": "cia/IDENTITY.md",
+      "change": "added"
+    },
+    {
+      "path": "source/album_image.c",
+      "change": "added"
+    },
+    {
+      "path": "source/album_image.h",
+      "change": "added"
+    },
+    {
+      "path": "source/api_response.c",
+      "change": "added"
+    },
+    {
+      "path": "source/api_response.h",
+      "change": "added"
+    },
+    {
+      "path": "source/app_flow.c",
+      "change": "added"
+    },
+    {
+      "path": "source/app_flow.h",
+      "change": "added"
+    },
+    {
+      "path": "source/app_identity.h",
+      "change": "added"
+    },
+    {
+      "path": "source/audio_tempo.c",
+      "change": "added"
+    },
+    {
+      "path": "source/audio_tempo.h",
+      "change": "added"
+    },
+    {
+      "path": "source/bili.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/bili.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/bili_transport.h",
+      "change": "added"
+    },
+    {
+      "path": "source/browse_ui.c",
+      "change": "added"
+    },
+    {
+      "path": "source/browse_ui.h",
+      "change": "added"
+    },
+    {
+      "path": "source/danmaku.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/danmaku.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/favorite_queue.c",
+      "change": "added"
+    },
+    {
+      "path": "source/favorite_queue.h",
+      "change": "added"
+    },
+    {
+      "path": "source/ime.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/ime_policy.c",
+      "change": "added"
+    },
+    {
+      "path": "source/ime_policy.h",
+      "change": "added"
+    },
+    {
+      "path": "source/main.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/net.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/net.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/numeric_text.h",
+      "change": "added"
+    },
+    {
+      "path": "source/pgc.c",
+      "change": "added"
+    },
+    {
+      "path": "source/pgc.h",
+      "change": "added"
+    },
+    {
+      "path": "source/pgc_ui.c",
+      "change": "added"
+    },
+    {
+      "path": "source/pgc_ui.h",
+      "change": "added"
+    },
+    {
+      "path": "source/playback_policy.c",
+      "change": "added"
+    },
+    {
+      "path": "source/playback_policy.h",
+      "change": "added"
+    },
+    {
+      "path": "source/player.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/player.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/screenshot.c",
+      "change": "added"
+    },
+    {
+      "path": "source/screenshot.h",
+      "change": "added"
+    },
+    {
+      "path": "source/settings.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/settings.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/social_api.c",
+      "change": "added"
+    },
+    {
+      "path": "source/social_api.h",
+      "change": "added"
+    },
+    {
+      "path": "source/social_ui.c",
+      "change": "added"
+    },
+    {
+      "path": "source/social_ui.h",
+      "change": "added"
+    },
+    {
+      "path": "source/thumb.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/ui.c",
+      "change": "modified"
+    },
+    {
+      "path": "source/ui.h",
+      "change": "modified"
+    },
+    {
+      "path": "source/video_actions_api.c",
+      "change": "added"
+    },
+    {
+      "path": "source/video_actions_api.h",
+      "change": "added"
+    },
+    {
+      "path": "source/video_actions_ui.c",
+      "change": "added"
+    },
+    {
+      "path": "source/video_actions_ui.h",
+      "change": "added"
+    },
+    {
+      "path": "source/video_info.c",
+      "change": "added"
+    },
+    {
+      "path": "source/video_info.h",
+      "change": "added"
+    },
+    {
+      "path": "test/api_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/app_flow_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/browse_ui_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/favorite_pages_ui_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/favorite_queue_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/history_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/navigation_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/pgc_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/pgc_ui_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/playback_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/screenshot_async_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/screenshot_stubs/3ds.h",
+      "change": "added"
+    },
+    {
+      "path": "test/screenshot_stubs/citro3d.h",
+      "change": "added"
+    },
+    {
+      "path": "test/settings_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/social_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/social_ui_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/stubs/3ds.h",
+      "change": "added"
+    },
+    {
+      "path": "test/stubs/citro2d.h",
+      "change": "added"
+    },
+    {
+      "path": "test/stubs/zlib.h",
+      "change": "added"
+    },
+    {
+      "path": "test/video_actions_test.c",
+      "change": "added"
+    },
+    {
+      "path": "test/video_actions_ui_test.c",
+      "change": "added"
+    }
+  ]
+}

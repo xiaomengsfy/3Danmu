@@ -28,7 +28,7 @@ void ui_log_scroll(int delta);   /* 日志滚动(行) */
  * 全工程用它代替 printf,多线程安全 */
 void ui_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-/* 里程碑落盘:写一行到 sdmc:/3ds/3danmu/trace.log,每次都 fclose。
+/* 里程碑落盘:写一行到 sdmc:/3ds/3danmu-kina/trace.log,每次都 fclose。
  *
  * 【为什么需要】整机死锁时不会有 Luma 崩溃页,内存里的调试日志也全没了 ——
  * 抠电池重启后什么线索都不剩。这个函数在关键节点各写一行并立即落盘,

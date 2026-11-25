@@ -10,6 +10,7 @@
 #include "tls.h"
 #include "wbi.h"
 #include "md5.h"
+#include "api_response.h"
 
 static char s_mixin[33] = {0};
 static int64_t s_mid = 0;          /* 登录用户 mid */
@@ -376,6 +377,13 @@ static int fetch_nav(void) {
 	HttpResponse res;
 	if (net_get("https://api.bilibili.com/x/web-interface/nav", &res) != 0)
 		return -1;
+	/* A completed 401 is definitive even without a JSON body. Transport/5xx
+	 * failures remain uncertain and must not be interpreted as a logout. */
+	if (res.status == 401) {
+		s_logged_in = false;
+		s_mid = 0;
+		s_uname[0] = 0;
+	}
 	if (res.status != 200 || !res.data) { net_response_free(&res); return -1; }
 	Json *j = json_parse(res.data, res.len);
 	if (!j) { net_response_free(&res); return -1; }
@@ -388,6 +396,8 @@ static int fetch_nav(void) {
 	char is_login[8] = {0};
 	json_get_str(j, -1, "data.isLogin", is_login, sizeof(is_login));
 	s_logged_in = (!strcmp(is_login, "true") || !strcmp(is_login, "1"));
+	s_mid = 0;
+	s_uname[0] = 0;
 	if (s_logged_in) {
 		json_get_str(j, -1, "data.uname", s_uname, sizeof(s_uname));
 		json_get_int(j, -1, "data.mid", &s_mid);   /* 收藏夹接口要用 */
@@ -430,6 +440,7 @@ void bili_logout(void) {
 	net_clear_cookies();
 	net_cookies_save_force("logout");   /* 故意清掉,绕开保险 */
 	s_logged_in = false;
+	s_mid = 0;
 	s_uname[0] = 0;
 	fetch_buvid();
 }
@@ -576,7 +587,7 @@ int bili_recommend(int page, BiliVideo *out, int max, int *count) {
 	return (*count > 0) ? 0 : -1;
 }
 
-/* 历史记录(需登录)。x/v2/history 简单分页,条目结构与稿件一致 */
+/* History includes licensed episodes; preserve their redirect/episode IDs. */
 int bili_history(int page, BiliVideo *out, int max, int *count) {
 	*count = 0;
 	char url[192];
@@ -585,75 +596,156 @@ int bili_history(int page, BiliVideo *out, int max, int *count) {
 	char *body = NULL;
 	Json *j = api_get(url, &body);
 	if (!j) return -1;
-	int arr = json_find(j, -1, "data");
-	int n = json_arr_len(j, arr);
-	for (int i = 0; i < n && *count < max; i++) {
-		int el = json_arr_at(j, arr, i);
-		parse_video_item(j, el, &out[*count], false);
-		if (out[*count].bvid[0] && out[*count].title[0]) (*count)++;
-	}
+	BiliApiResult result=api_response_history(0,200,body,strlen(body),out,max,count);
 	json_free(j);
 	free(body);
-	return (n >= 0) ? 0 : -1;
+	return result.outcome==BILI_API_SUCCESS?0:-1;
 }
 
-/* 收藏夹(默认收藏夹,需登录)。两步:查默认夹 id → 拉内容 */
-static int64_t s_fav_fid = 0;
 static bool s_sub_is_ai = false;
+
+/* New personal endpoints retain no folder/page/like cache. main owns request
+ * generations and serializes run_bg jobs; only current-account identity lives
+ * here, and every definitive login rejection invalidates it. */
+static BiliApiResult personal_result(BiliApiResult r) {
+	s_last_err[0] = 0;
+	if (r.login_required) {
+		s_logged_in = false; s_mid = 0; s_uname[0] = 0;
+		snprintf(s_last_err, sizeof(s_last_err), "登录已失效，请重新登录");
+	} else if (r.http_status==412 || r.http_status==429) {
+        snprintf(s_last_err,sizeof(s_last_err),"HTTP %d 请求受限，请等待60秒后重试",r.http_status);
+    } else if (r.outcome == BILI_API_REJECTED) {
+		if (r.has_code && r.code == 0) {
+			snprintf(s_last_err, sizeof(s_last_err), "接口要求验证，本次请求被拒绝");
+		} else if (r.has_code) {
+			char code[24]; i64_to_str(r.code, code);
+			snprintf(s_last_err, sizeof(s_last_err), "请求被拒绝，错误码 %s", code);
+		} else snprintf(s_last_err, sizeof(s_last_err), "请求被拒绝，HTTP %d", r.http_status);
+	} else if (r.outcome == BILI_API_UNKNOWN) {
+		snprintf(s_last_err, sizeof(s_last_err), "结果未知，请核对后再操作");
+	}
+	if (r.outcome != BILI_API_SUCCESS) {
+		/* No body, URL query, CSRF, Cookie or remote message is logged. */
+		char code[24]; i64_to_str(r.code, code);
+		ui_trace("personal API: outcome=%d http=%d code=%s known=%d",
+		         (int)r.outcome, r.http_status, code, (int)r.has_code);
+	}
+	return r;
+}
+static BiliApiResult personal_reject(int64_t code) {
+	BiliApiResult r={.outcome=BILI_API_REJECTED,.code=code,.has_code=true,.login_required=code==-101};
+	return personal_result(r);
+}
+/* A complete gzip stream is required; partial output cannot acknowledge a
+ * write. Size growth is bounded, and the common JSON path allocates nothing. */
+static int personal_decode(HttpResponse *res) {
+	if (!res->data || res->len<2 || (u8)res->data[0]!=0x1f || (u8)res->data[1]!=0x8b) return 0;
+	const size_t limit=2u*1024*1024;
+	if(res->len>limit) return -1;
+	size_t cap=res->len*8+4096;if(cap>limit) cap=limit;
+	char *plain=malloc(cap);if(!plain) return -1;
+	z_stream zs;memset(&zs,0,sizeof(zs));
+	if(inflateInit2(&zs,15+32)!=Z_OK) { free(plain);return -1; }
+	zs.next_in=(Bytef *)res->data;zs.avail_in=(uInt)res->len;
+	int zr;
+	for(;;) {
+		zs.next_out=(Bytef *)plain+zs.total_out;
+		zs.avail_out=(uInt)(cap-1-zs.total_out);
+		zr=inflate(&zs,Z_FINISH);
+		if(zr==Z_STREAM_END || (zr!=Z_OK && zr!=Z_BUF_ERROR) || zs.avail_out>0 || cap==limit) break;
+		size_t next=cap*2;if(next>limit) next=limit;
+		char *grown=realloc(plain,next);if(!grown) break;
+		plain=grown;cap=next;
+	}
+	bool complete=zr==Z_STREAM_END && zs.avail_in==0;
+	size_t got=zs.total_out;inflateEnd(&zs);
+	if(!complete) { free(plain);return -1; }
+	plain[got]=0;free(res->data);res->data=plain;res->len=got;return 0;
+}
+/* Respect server refusal. Keep one minute of local read backoff across
+ * list/view clients so reopening a failed queue cannot flood the same API. */
+static u64 s_personal_block_until,s_favorite_request_at;
+static int s_personal_block_status;
+static bool s_favorite_request_seen;
+static int personal_get(const char *url,HttpResponse *res) {
+    memset(res,0,sizeof(*res));
+    u64 now=osGetTime();
+    if(now<s_personal_block_until){res->status=s_personal_block_status;return 0;}
+    bool favorite=strstr(url,"/x/v3/fav/resource/list?")!=NULL;
+    uint32_t generation=net_request_generation();
+    while(favorite && s_favorite_request_seen && now>=s_favorite_request_at && now-s_favorite_request_at<1000){
+        if(net_is_shutting_down() || generation!=net_request_generation())return -1;
+        svcSleepThread(10000000LL);now=osGetTime();
+    }
+    if(net_is_shutting_down() || generation!=net_request_generation())return -1;
+    if(favorite){s_favorite_request_seen=true;s_favorite_request_at=now;}
+    int status=net_get_ref(url,"https://www.bilibili.com/",res);
+    if(status==0 && (res->status==412 || res->status==429)){
+        s_personal_block_status=res->status;s_personal_block_until=osGetTime()+60000;
+    }
+    if(status==0 && res->status==200)status=personal_decode(res);
+    return status;
+}
+BiliApiResult bili_fav_folders(BiliFavFolder *out, int max, BiliPageInfo *info) {
+	if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+	if(info) memset(info,0,sizeof(*info));
+	if(!out || max<=0 || !info) return personal_reject(-400);
+	if(!s_logged_in || s_mid<=0) return personal_reject(-101);
+	char mid[24],url[192];i64_to_str(s_mid,mid);
+	snprintf(url,sizeof(url),"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=%s",mid);
+	HttpResponse res;int status=personal_get(url,&res);
+	BiliApiResult r=api_response_folders(status,res.status,res.data,res.len,out,max,info);
+	net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_fav_folder(int64_t folder_id,int page,BiliVideo *out,int max,BiliPageInfo *info) {
+	if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+	if(info) memset(info,0,sizeof(*info));
+	if(!out || max<=0 || !info || folder_id<=0 || page<=0) return personal_reject(-400);
+	if(!s_logged_in || s_mid<=0) return personal_reject(-101);
+	char fid[24],url[224];i64_to_str(folder_id,fid);
+	snprintf(url,sizeof(url),"https://api.bilibili.com/x/v3/fav/resource/list?media_id=%s&pn=%d&ps=20&platform=web",fid,page);
+	HttpResponse res;int status=personal_get(url,&res);
+	BiliApiResult r=api_response_favorites(status,res.status,res.data,res.len,page,out,max,info);
+	net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_like_set(int64_t aid,bool like) {
+	if(aid<=0) return personal_reject(-400);
+	if(!s_logged_in) return personal_reject(-101);
+	const char *csrf=net_get_cookie("bili_jct");
+	if(!csrf || !csrf[0]) {
+		BiliApiResult r=personal_reject(-111);
+		snprintf(s_last_err,sizeof(s_last_err),"缺少 CSRF 凭据，无法提交");return r;
+	}
+	char id[24],csrf_copy[512];i64_to_str(aid,id);
+	/* Snapshot memory only. Never persist or print credentials here. */
+	snprintf(csrf_copy,sizeof(csrf_copy),"%s",csrf);
+	const char *keys[]={"aid","like","csrf"};
+	const char *vals[]={id,like?"1":"2",csrf_copy};
+	HttpResponse res;int status=net_post_fields_once("https://api.bilibili.com/x/web-interface/archive/like",keys,vals,3,&res);
+	if(status==0 && res.status==200) status=personal_decode(&res);
+	BiliApiResult r=api_response_result(status,res.status,res.data,res.len);
+	net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_like_status(int64_t aid,BiliLikeState *state) {
+	if(state) *state=BILI_LIKE_UNKNOWN;
+	if(aid<=0 || !state) return personal_reject(-400);
+	if(!s_logged_in) return personal_reject(-101);
+	char id[24],url[176];i64_to_str(aid,id);
+	snprintf(url,sizeof(url),"https://api.bilibili.com/x/web-interface/archive/has/like?aid=%s",id);
+	HttpResponse res;int status=personal_get(url,&res);
+	BiliApiResult r=api_response_like(status,res.status,res.data,res.len,state);
+	net_response_free(&res);return personal_result(r);
+}
 int bili_fav(int page, BiliVideo *out, int max, int *count) {
-	*count = 0;
-	if (!s_mid && fetch_nav() != 0) return -1;
-	if (!s_mid) return -1;
-	char midstr[24], url[224];
-	i64_to_str(s_mid, midstr);
-	if (!s_fav_fid) {
-		snprintf(url, sizeof(url),
-		         "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=%s",
-		         midstr);
-		char *body = NULL;
-		Json *j = api_get(url, &body);
-		if (!j) return -1;
-		int arr = json_find(j, -1, "data.list");
-		if (json_arr_len(j, arr) > 0)
-			json_get_int(j, json_arr_at(j, arr, 0), "id", &s_fav_fid);
-		json_free(j);
-		free(body);
-		if (!s_fav_fid) return -1;
-	}
-	char fidstr[24];
-	i64_to_str(s_fav_fid, fidstr);
-	snprintf(url, sizeof(url),
-	         "https://api.bilibili.com/x/v3/fav/resource/list?"
-	         "media_id=%s&pn=%d&ps=20&platform=web", fidstr, page);
-	char *body = NULL;
-	Json *j = api_get(url, &body);
-	if (!j) return -1;
-	int arr = json_find(j, -1, "data.medias");
-	int n = json_arr_len(j, arr);
-	for (int i = 0; i < n && *count < max; i++) {
-		int el = json_arr_at(j, arr, i);
-		BiliVideo *v = &out[*count];
-		memset(v, 0, sizeof(*v));
-		v->views = -1;
-		int64_t type = 0;
-		json_get_int(j, el, "type", &type);
-		if (type != 2) continue;                 /* 2 = 视频稿件 */
-		json_get_str(j, el, "bvid", v->bvid, sizeof(v->bvid));
-		json_get_int(j, el, "id", &v->aid);
-		json_get_str(j, el, "title", v->title, sizeof(v->title));
-		json_get_str(j, el, "cover", v->pic, sizeof(v->pic));
-		fix_pic_url(v->pic, sizeof(v->pic));
-		json_get_str(j, el, "upper.name", v->author, sizeof(v->author));
-		int64_t d = 0, play = -1, np = 0;
-		if (json_get_int(j, el, "duration", &d)) v->duration = (int)d;
-		if (json_get_int(j, el, "cnt_info.play", &play)) v->views = play;
-		/* 收藏夹的条目里,分 P 数这个字段叫 page(不是 videos) */
-		if (json_get_int(j, el, "page", &np) && np > 0) v->pages = (int)np;
-		if (v->bvid[0] && v->title[0]) (*count)++;
-	}
-	json_free(j);
-	free(body);
-	return 0;
+	/* Compatibility only; the UI uses the explicit folder chooser APIs. */
+	if(!count) return -1;
+	*count=0;if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+	BiliFavFolder first;BiliPageInfo info;
+	BiliApiResult r=bili_fav_folders(&first,1,&info);
+	if(r.outcome!=BILI_API_SUCCESS) return -1;
+	if(!info.count) return 0;
+	r=bili_fav_folder(first.id,page,out,max,&info);*count=info.count;
+	return r.outcome==BILI_API_SUCCESS?0:-1;
 }
 
 int bili_popular(int page, BiliVideo *out, int max, int *count) {
@@ -1673,4 +1765,145 @@ int bili_qr_poll(const char *qrcode_key, int *code) {
 	json_free(j);
 	free(body);
 	return 0;
+}
+
+/* New browse clients never fall back to unsigned or unrelated endpoints. */
+static int browse_signed_get(const char *path,const char **keys,const char **vals,int count,HttpResponse *res) {
+    memset(res,0,sizeof(*res));
+    if(!s_mixin[0] && fetch_nav()!=0) return -1;
+    char query[1536],url[1664];
+    if(wbi_sign(keys,vals,count,s_mixin,net_now(),query,sizeof(query))!=0) return -1;
+    int n=snprintf(url,sizeof(url),"https://api.bilibili.com%s?%s",path,query);
+    if(n<0 || (size_t)n>=sizeof(url)) return -1;
+    return personal_get(url,res);
+}
+BiliApiResult bili_profile(BiliProfile *out) {
+    if(out) memset(out,0,sizeof(*out));
+    if(!out) return personal_reject(-400);
+    if(!s_logged_in) return personal_reject(-101);
+    HttpResponse res;int status=personal_get("https://api.bilibili.com/x/web-interface/nav",&res);
+    BiliApiResult r=api_response_profile(status,res.status,res.data,res.len,true,out);
+    if(r.outcome==BILI_API_SUCCESS) {
+        s_mid=out->mid;snprintf(s_uname,sizeof(s_uname),"%s",out->name);
+    }
+    net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_watchlater(int page,BiliVideo *out,int max,BiliPageInfo *info) {
+    if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+    if(info) memset(info,0,sizeof(*info));
+    if(!out || max<=0 || !info || page<=0) return personal_reject(-400);
+    if(!s_logged_in) return personal_reject(-101);
+    HttpResponse res;int status=personal_get("https://api.bilibili.com/x/v2/history/toview",&res);
+    BiliApiResult r=api_response_watchlater(status,res.status,res.data,res.len,page,out,max,info,0,NULL);
+    net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_watchlater_contains(int64_t aid,bool *found) {
+    if(found) *found=false;
+    if(!found || aid<=0) return personal_reject(-400);
+    if(!s_logged_in) return personal_reject(-101);
+    /* Membership scans every raw entry; only one video slot needed. */
+    BiliVideo unused;BiliPageInfo info;
+    HttpResponse res;int status=personal_get("https://api.bilibili.com/x/v2/history/toview",&res);
+    BiliApiResult r=api_response_watchlater(status,res.status,res.data,res.len,1,&unused,1,&info,aid,found);
+    net_response_free(&res);return personal_result(r);
+}
+static BiliApiResult watchlater_write(int64_t aid,bool remove) {
+    if(aid<=0) return personal_reject(-400);
+    if(!s_logged_in) return personal_reject(-101);
+    const char *csrf=net_get_cookie("bili_jct");
+    if(!csrf || !csrf[0]) return personal_reject(-111);
+    char id[24],token[512];i64_to_str(aid,id);snprintf(token,sizeof(token),"%s",csrf);
+    const char *keys[]={"aid","csrf"},*vals[]={id,token};
+    HttpResponse res;int status=net_post_fields_once(remove?"https://api.bilibili.com/x/v2/history/toview/del":
+        "https://api.bilibili.com/x/v2/history/toview/add",keys,vals,2,&res);
+    if(status==0 && res.status==200) status=personal_decode(&res);
+    BiliApiResult r=api_response_result(status,res.status,res.data,res.len);
+    net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_watchlater_add(int64_t aid) { return watchlater_write(aid,false); }
+BiliApiResult bili_watchlater_remove(int64_t aid) { return watchlater_write(aid,true); }
+BiliApiResult bili_search_users(const char *keyword,int page,BiliProfile *out,int max,BiliPageInfo *info) {
+    if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+    if(info) memset(info,0,sizeof(*info));
+    if(!keyword || !keyword[0] || strlen(keyword)>127 || page<=0 || !out || max<=0 || !info) return personal_reject(-400);
+    char pn[12];snprintf(pn,sizeof(pn),"%d",page);
+    const char *keys[]={"keyword","page","page_size","search_type"};
+    const char *vals[]={keyword,pn,"20","bili_user"};
+    HttpResponse res;int status=browse_signed_get("/x/web-interface/wbi/search/type",keys,vals,4,&res);
+    BiliApiResult r=api_response_users(status,res.status,res.data,res.len,page,out,max,info);
+    net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_user_profile(int64_t mid,BiliProfile *out) {
+    if(out) memset(out,0,sizeof(*out));
+    if(mid<=0 || !out) return personal_reject(-400);
+    char id[24];i64_to_str(mid,id);const char *keys[]={"mid"},*vals[]={id};
+    HttpResponse res;int status=browse_signed_get("/x/space/wbi/acc/info",keys,vals,1,&res);
+    BiliApiResult r=api_response_profile(status,res.status,res.data,res.len,false,out);
+    if(r.outcome==BILI_API_SUCCESS && out->mid!=mid) { memset(out,0,sizeof(*out));r.outcome=BILI_API_UNKNOWN; }
+    net_response_free(&res);return personal_result(r);
+}
+BiliApiResult bili_user_videos(int64_t mid,int page,BiliVideo *out,int max,BiliPageInfo *info) {
+    if(out && max>0) memset(out,0,(size_t)max*sizeof(*out));
+    if(info) memset(info,0,sizeof(*info));
+    if(mid<=0 || page<=0 || !out || max<=0 || !info) return personal_reject(-400);
+    char id[24],pn[12];i64_to_str(mid,id);snprintf(pn,sizeof(pn),"%d",page);
+    const char *keys[]={"mid","pn","ps","order"},*vals[]={id,pn,"20","pubdate"};
+    HttpResponse res;int status=browse_signed_get("/x/space/wbi/arc/search",keys,vals,4,&res);
+    BiliApiResult r=api_response_user_videos(status,res.status,res.data,res.len,page,out,max,info);
+    net_response_free(&res);return personal_result(r);
+}
+
+int64_t bili_account_id(void) { return s_logged_in?s_mid:0; }
+
+/* Shared module transport, bounded and deliberately separate from media IO. */
+static bool module_url(const char *path,char *out,size_t capacity) {
+    if(!path || !path[0])return false;
+    if(path[0]=='/' && path[1]!='/') {
+        int n=snprintf(out,capacity,"https://api.bilibili.com%s",path);
+        return n>0 && (size_t)n<capacity;
+    }
+    const char *hosts[]={"https://api.bilibili.com/","https://api.vc.bilibili.com/","https://message.bilibili.com/"};
+    for(unsigned i=0;i<sizeof(hosts)/sizeof(hosts[0]);i++)if(!strncmp(path,hosts[i],strlen(hosts[i]))) {
+        if(strlen(path)>=capacity)return false;
+        memcpy(out,path,strlen(path)+1);return true;
+    }
+    return false;
+}
+BiliApiResult bili_fetch_json(const char *path,const char **keys,const char **vals,int count,bool sign,HttpResponse *out) {
+    if(out)memset(out,0,sizeof(*out));
+    char url[2048];
+    if(!out || count<0 || count>15 || (count && (!keys || !vals)) || !module_url(path,url,sizeof(url)))return personal_reject(-400);
+    for(int i=0;i<count;i++)if(!keys[i] || !vals[i] || strlen(keys[i])>31 || strlen(vals[i])>480)return personal_reject(-400);
+    int status;
+    if(sign) {
+        if(path[0]!='/')return personal_reject(-400);
+        status=browse_signed_get(path,keys,vals,count,out);
+    } else {
+        size_t used=strlen(url);
+        for(int i=0;i<count;i++) {
+            char key[96],value[1444];wbi_urlencode(key,sizeof(key),keys[i]);wbi_urlencode(value,sizeof(value),vals[i]);
+            int n=snprintf(url+used,sizeof(url)-used,"%c%s=%s",strchr(url,'?')?'&':'?',key,value);
+            if(n<0 || (size_t)n>=sizeof(url)-used)return personal_reject(-400);
+            used+=(size_t)n;
+        }
+        status=personal_get(url,out);
+    }
+    return personal_result(api_response_result(status,out->status,out->data,out->len));
+}
+BiliApiResult bili_submit_json(const char *path,const char **keys,const char **vals,int count,HttpResponse *out) {
+    if(out)memset(out,0,sizeof(*out));
+    char url[192];
+    if(!out || !path || path[0]!='/' || count<0 || count>15 || (count && (!keys || !vals)) || !module_url(path,url,sizeof(url)))return personal_reject(-400);
+    if(!s_logged_in)return personal_reject(-101);
+    const char *csrf=net_get_cookie("bili_jct");
+    if(!csrf || !csrf[0] || strlen(csrf)>=512)return personal_reject(-111);
+    const char *all_keys[16],*all_vals[16];char token[512];memcpy(token,csrf,strlen(csrf)+1);
+    for(int i=0;i<count;i++) {
+        if(!keys[i] || !vals[i] || !strcmp(keys[i],"csrf") || !strcmp(keys[i],"csrf_token"))return personal_reject(-400);
+        all_keys[i]=keys[i];all_vals[i]=vals[i];
+    }
+    all_keys[count]="csrf";all_vals[count]=token;
+    int status=net_post_fields_once(url,all_keys,all_vals,count+1,out);
+    if(status==0 && out->status==200)status=personal_decode(out);
+    return personal_result(api_response_result(status,out->status,out->data,out->len));
 }

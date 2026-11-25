@@ -1,4 +1,4 @@
-/* settings: 用户设置的 SD 卡持久化(sdmc:/3ds/3danmu/settings.txt)
+/* settings: 用户设置的 SD 卡持久化(sdmc:/3ds/3danmu-kina/settings.txt)
  *
  * 只存整数,key=value 一行一条。设计取舍:
  *   - settings_set() 当场落盘 —— 文件几十字节,写盘 1~2ms,而改设置

@@ -1,3 +1,4 @@
+#include "app_identity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +9,7 @@
 
 #define UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 #define REFERER "https://www.bilibili.com"
-#define COOKIE_DIR  "sdmc:/3ds/3danmu"
+#define COOKIE_DIR  APP_DATA_DIR
 #define COOKIE_FILE COOKIE_DIR "/cookies.txt"
 /* 24 不是 16:登录后有 SESSDATA/bili_jct/DedeUserID/DedeUserID__ckMd5/sid,
  * 加上 b_nut/buvid3/buvid4/buvid_fp 就逼近 16。net_set_cookie 满了是
@@ -60,17 +61,18 @@ static LightLock s_req_lock;
  * 同一时刻只有一个请求,不会串。 */
 #define NET_INFLIGHT_MAX 4
 static LightLock s_cancel_lock;
-static struct { httpcContext *ctx; bool img; } s_inflight[NET_INFLIGHT_MAX];
+typedef enum { INFLIGHT_API, INFLIGHT_IMAGE, INFLIGHT_STREAM } InflightKind;
+static struct { httpcContext *ctx; InflightKind kind; } s_inflight[NET_INFLIGHT_MAX];
 static bool s_req_cancelable = false;   /* 受 s_req_lock 保护 */
 /* 一旦置位就不再发起任何新请求 —— 退出流程专用,见 net_shutdown_begin */
 static volatile bool s_shutdown = false;
 
 bool net_is_shutting_down(void) { return s_shutdown; }
 
-static void inflight_add(httpcContext *c, bool img) {
+static void inflight_add(httpcContext *c, InflightKind kind) {
 	LightLock_Lock(&s_cancel_lock);
 	for (int i = 0; i < NET_INFLIGHT_MAX; i++)
-		if (!s_inflight[i].ctx) { s_inflight[i].ctx = c; s_inflight[i].img = img; break; }
+		if (!s_inflight[i].ctx) { s_inflight[i].ctx = c; s_inflight[i].kind = kind; break; }
 	LightLock_Unlock(&s_cancel_lock);
 }
 
@@ -86,20 +88,31 @@ static void inflight_del(httpcContext *c) {
 static void cancel_inflight(bool only_img) {
 	LightLock_Lock(&s_cancel_lock);
 	for (int i = 0; i < NET_INFLIGHT_MAX; i++)
-		if (s_inflight[i].ctx && (!only_img || s_inflight[i].img))
+		if (s_inflight[i].ctx && (!only_img || s_inflight[i].kind == INFLIGHT_IMAGE))
 			httpcCancelConnection(s_inflight[i].ctx);
 	LightLock_Unlock(&s_cancel_lock);
 }
 
 void net_cancel_img(void) { cancel_inflight(true); }
 
-/* 掐掉在途的**视频流**连接(登记表里 img=false 的那些)。
+/* 掐掉在途的**视频流**连接。
  * 播放器退出时用:比等 join 超时快几个数量级。
  * 和 net_cancel_img 一样,持 s_cancel_lock 调用,不会碰到已关闭的 ctx。 */
 void net_cancel_streams(void) {
 	LightLock_Lock(&s_cancel_lock);
 	for (int i = 0; i < NET_INFLIGHT_MAX; i++)
-		if (s_inflight[i].ctx && !s_inflight[i].img)
+		if (s_inflight[i].ctx && s_inflight[i].kind == INFLIGHT_STREAM)
+			httpcCancelConnection(s_inflight[i].ctx);
+	LightLock_Unlock(&s_cancel_lock);
+}
+
+static volatile uint32_t s_request_generation;
+uint32_t net_request_generation(void){return s_request_generation;}
+void net_cancel_requests(void) {
+	LightLock_Lock(&s_cancel_lock);
+ ++s_request_generation;
+	for (int i = 0; i < NET_INFLIGHT_MAX; i++)
+		if (s_inflight[i].ctx && s_inflight[i].kind == INFLIGHT_API)
 			httpcCancelConnection(s_inflight[i].ctx);
 	LightLock_Unlock(&s_cancel_lock);
 }
@@ -392,23 +405,24 @@ static void resolve_location(const char *base, const char *loc, char *out, size_
 }
 
 /* 表单值的 URL 编码(RFC3986 未保留字符原样,其余 %XX) */
-static void url_encode(char *dst, size_t dn, const char *src) {
+static bool url_encode(char *dst, size_t dn, const char *src) {
 	static const char *hex = "0123456789ABCDEF";
 	size_t o = 0;
 	for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
 		if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
 		    (*p >= '0' && *p <= '9') ||
 		    *p == '-' || *p == '_' || *p == '.' || *p == '~') {
-			if (o + 1 >= dn) break;
+			if (o + 1 >= dn) return false;
 			dst[o++] = (char)*p;
 		} else {
-			if (o + 3 >= dn) break;
+			if (o + 3 >= dn) return false;
 			dst[o++] = '%';
 			dst[o++] = hex[*p >> 4];
 			dst[o++] = hex[*p & 0xF];
 		}
 	}
 	dst[o] = 0;
+	return true;
 }
 
 /* ---------- 服务器时钟对齐 ----------
@@ -476,12 +490,12 @@ typedef struct { const char *k, *v; } PostField;
 
 static int do_request_ka(HTTPC_RequestMethod method, const char *url,
                          const char *body, const PostField *fields, int nf,
-                         HttpResponse *res, int depth, bool keepalive);
+                         HttpResponse *res, int depth, bool keepalive, bool once);
 
 static int do_request_ex(HTTPC_RequestMethod method, const char *url,
                          const char *body, const PostField *fields, int nf,
                          HttpResponse *res, int depth) {
-	return do_request_ka(method, url, body, fields, nf, res, depth, false);
+	return do_request_ka(method, url, body, fields, nf, res, depth, false, false);
 }
 
 static int do_request(HTTPC_RequestMethod method, const char *url,
@@ -497,10 +511,10 @@ static void close_ctx(httpcContext *ctx) {
 
 static int do_request_ka(HTTPC_RequestMethod method, const char *url,
                          const char *body, const PostField *fields, int nf,
-                         HttpResponse *res, int depth, bool keepalive) {
+                         HttpResponse *res, int depth, bool keepalive, bool once) {
+	res->data = NULL; res->len = 0; res->status = 0;
 	if (s_shutdown) return -1;   /* 正在退出:别再开新连接,否则清理永远等不完 */
 	if (depth > MAX_REDIRECTS) return -1;
-	res->data = NULL; res->len = 0; res->status = 0;
 	/* 只在最外层清:跟随重定向时要保留中途那一跳设的 cookie */
 	if (depth == 0) s_setcookie[0] = 0;
 
@@ -510,7 +524,7 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 	/* 登记为「可取消」,直到下面任意一条路径把它关掉。
 	 * 所有出口都走 close_ctx(),别再直接写 httpcCloseContext —— 漏一处
 	 * 就会留下一个指向已失效栈变量的登记项。 */
-	inflight_add(&ctx, s_req_cancelable);
+	inflight_add(&ctx, s_req_cancelable ? INFLIGHT_IMAGE : INFLIGHT_API);
 
 	httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify); /* 3DS 根证书太旧,禁用校验 */
 	/* keep-alive 分场景:
@@ -533,26 +547,32 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 		char tmp[2560];   /* Gaia 指纹 payload 有 1KB 出头 */
 		size_t len = 0;
 		if (fields && nf > 0) {
-			for (int i = 0; i < nf && len < sizeof(tmp) - 2; i++) {
+			for (int i = 0; i < nf; i++) {
+				char key[128], enc[1536];
+				if (!fields[i].k || !fields[i].v ||
+				    !url_encode(key, sizeof(key), fields[i].k) ||
+				    !url_encode(enc, sizeof(enc), fields[i].v) ||
+				    len + strlen(key) + strlen(enc) + (i ? 2u : 1u) >= sizeof(tmp)) {
+					close_ctx(&ctx);
+					return -7; /* never submit a truncated form */
+				}
 				if (i) tmp[len++] = '&';
-				len += (size_t)snprintf(tmp + len, sizeof(tmp) - len,
-				                        "%s=", fields[i].k);
-				char enc[512];
-				url_encode(enc, sizeof(enc), fields[i].v);
-				len += (size_t)snprintf(tmp + len, sizeof(tmp) - len,
-				                        "%s", enc);
+				int written = snprintf(tmp + len, sizeof(tmp) - len, "%s=%s", key, enc);
+				len += (size_t)written;
 			}
 		} else if (body) {
-			len = (size_t)snprintf(tmp, sizeof(tmp), "%s", body);
+			len = strlen(body);
+			if (len >= sizeof(tmp)) { close_ctx(&ctx); return -7; }
+			memcpy(tmp, body, len);
 		}
 		if (len > 0) {
 			postbuf = linearAlloc((len + 31) & ~31u);
-			if (postbuf) {
-				memcpy(postbuf, tmp, len);
-				httpcAddRequestHeaderField(&ctx, "Content-Type",
-					s_post_json ? "application/json"
-					            : "application/x-www-form-urlencoded");
-				httpcAddPostDataRaw(&ctx, (const u32 *)postbuf, (u32)len);
+			if (!postbuf) { close_ctx(&ctx); return -5; }
+			memcpy(postbuf, tmp, len);
+			if (R_FAILED(httpcAddRequestHeaderField(&ctx, "Content-Type",
+				s_post_json ? "application/json" : "application/x-www-form-urlencoded")) ||
+			    R_FAILED(httpcAddPostDataRaw(&ctx, (const u32 *)postbuf, (u32)len))) {
+				close_ctx(&ctx); linearFree(postbuf); return -7;
 			}
 		}
 	}
@@ -580,6 +600,7 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 	}
 
 	learn_server_time(&ctx);
+	res->status = (int)status;
 
 	/* 【Set-Cookie 留档】扫码登录曾经只从 poll 返回的 data.url 的 query 里
 	 * 取 SESSDATA —— 服务端一改返回格式,那条路就悄无声息地断了(url 还在、
@@ -594,7 +615,7 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 		s_setcookie[0] = 0;
 	absorb_login_cookies();
 
-	if (status >= 301 && status <= 308 && status != 304) {
+	if (!once && status >= 301 && status <= 308 && status != 304) {
 		char loc[1024] = {0};
 		if (R_SUCCEEDED(httpcGetResponseHeader(&ctx, "Location", loc, sizeof(loc))) && loc[0]) {
 			char next[1024];
@@ -604,7 +625,7 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 			g_net_last_redirects++;
 			/* 302 → GET */
 			return do_request_ka(HTTPC_METHOD_GET, next, NULL, NULL, 0,
-			                     res, depth + 1, keepalive);
+			                     res, depth + 1, keepalive, false);
 		}
 	}
 
@@ -616,8 +637,14 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 		return -5;
 	}
 	size_t total = 0;
+	u64 deadline = once ? osGetTime() + 20000 : 0;
 
 	for (;;) {
+		if (once && (total >= 1024u * 1024 || osGetTime() >= deadline)) {
+			free(buf); httpcCancelConnection(&ctx); close_ctx(&ctx);
+			if (postbuf) linearFree(postbuf);
+			return -6;
+		}
 		if (total + DL_CHUNK > cap) {
 			cap *= 2;
 			char *nb = (char *)realloc(buf, cap + 1);
@@ -630,7 +657,22 @@ static int do_request_ka(HTTPC_RequestMethod method, const char *url,
 			buf = nb;
 		}
 		u32 got = 0;
-		rc = httpcDownloadData(&ctx, (u8 *)buf + total, DL_CHUNK, &got);
+		if (once) {
+			/* libctru's download helper has no timeout. Obtain the actual
+			 * byte count around the bounded receive IPC instead. */
+			u32 before = 0, after = 0, content = 0;
+			rc = httpcGetDownloadSizeState(&ctx, &before, &content);
+			u64 now = osGetTime();
+			if (R_SUCCEEDED(rc) && now < deadline)
+				rc = httpcReceiveDataTimeout(&ctx, (u8 *)buf + total, DL_CHUNK,
+				                             (deadline - now) * 1000000ULL);
+			else rc = -1;
+			if (R_FAILED(httpcGetDownloadSizeState(&ctx, &after, &content)) ||
+			    after < before || after - before > DL_CHUNK) rc = -1;
+			else got = after - before;
+		} else {
+			rc = httpcDownloadData(&ctx, (u8 *)buf + total, DL_CHUNK, &got);
+		}
 		total += got;
 		if (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING)
 			continue;
@@ -704,7 +746,7 @@ int net_get_img(const char *url, HttpResponse *res) {
 	 * 而不是加并发路数。 */
 	LightLock_Lock(&s_req_lock);
 	s_req_cancelable = true;    /* 本次允许被 net_cancel_img 掐掉 */
-	int r = do_request_ka(HTTPC_METHOD_GET, url, NULL, NULL, 0, res, 0, true);
+	int r = do_request_ka(HTTPC_METHOD_GET, url, NULL, NULL, 0, res, 0, true, false);
 	s_req_cancelable = false;
 	LightLock_Unlock(&s_req_lock);
 	return r;
@@ -742,6 +784,28 @@ int net_post_fields(const char *url, const char *const *keys,
 	return r;
 }
 
+int net_post_fields_once(const char *url, const char *const *keys,
+                         const char *const *vals, int n, HttpResponse *res) {
+	if (!res) return -1;
+	memset(res, 0, sizeof(*res));
+	if (!url || !url[0] || !keys || !vals || n <= 0 || n > 24) return -1;
+	PostField fields[24];
+	for (int i = 0; i < n; i++) {
+		if (!keys[i] || !keys[i][0] || !vals[i]) return -1;
+		fields[i].k = keys[i]; fields[i].v = vals[i];
+	}
+	LightLock_Lock(&s_req_lock);
+	g_net_last_step = 0;
+	g_net_last_redirects = 0;
+	int r = do_request_ka(HTTPC_METHOD_POST, url, NULL, fields, n, res, 0, false, true);
+	if (r < 0) {
+		g_net_last_step = -r;
+		printf("single post failed step%d; no retry\n", -r);
+	}
+	LightLock_Unlock(&s_req_lock);
+	return r;
+}
+
 void net_response_free(HttpResponse *res) {
 	free(res->data);
 	res->data = NULL;
@@ -762,9 +826,9 @@ static int ns_open_internal(NetStream *s, const char *url, u64 offset, int depth
 	if (s_shutdown) return -1;
 	Result rc = httpcOpenContext(&s->ctx, HTTPC_METHOD_GET, url, 1);
 	if (R_FAILED(rc)) return -2;
-	/* 流也登记进去:退出时要能一起掐,否则下载线程卡在 ns_read 里收不回来。
-	 * img=false —— 按 HOME 时不掐流,那会打断正在看的视频。 */
-	inflight_add(&s->ctx, false);
+	/* Separate from API/image requests: modal cancellation must preserve this
+	 * stream, while player exit and full shutdown must still interrupt it. */
+	inflight_add(&s->ctx, INFLIGHT_STREAM);
 	httpcSetSSLOpt(&s->ctx, SSLCOPT_DisableVerify);
 	httpcSetKeepAlive(&s->ctx, HTTPC_KEEPALIVE_ENABLED);
 	add_common_headers(&s->ctx);

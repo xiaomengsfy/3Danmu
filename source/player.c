@@ -21,6 +21,8 @@
 #include <libavutil/opt.h>
 
 #include "player.h"
+#include "audio_tempo.h"
+#include "screenshot.h"
 #include "thread_util.h"
 #include "net.h"
 #include "settings.h"
@@ -173,11 +175,16 @@ typedef struct {
 	SwrContext *swr;
 	AVFrame *aframe;
 	ndspWaveBuf wbuf[AUDIO_NBUFS];
+	/* Screenshot chime: main-thread channel 1, independent of stream channel 0. */
+	ndspWaveBuf shot_wave;
+	s16 *shot_pcm;
 	s16 *abuf;
 	int next_wbuf;
 	s16 pending[AUDIO_SAMPLES_PER_BUF * 2 * 4];
 	int pending_n;
-	u64 samples_done;
+	AudioTempo *tempo;
+	double audio_completed_seconds, audio_queued_seconds;
+	double audio_start[AUDIO_NBUFS], audio_duration[AUDIO_NBUFS];
 	bool audio_ok;              /* 整条音频链路可用(解码器 + 重采样 + NDSP) */
 	/* 【和 audio_ok 分开】只表示"ndspInit 成功过,欠一次 ndspExit"。
 	 * 清理的判据必须是"我有没有拿到它",不能是"整件事成没成" ——
@@ -187,7 +194,8 @@ typedef struct {
 	 * 「这个视频本来就没音轨」——前者要用户去导一次固件,后者什么都不用做。
 	 * 都显示成"无声音"的话,用户只会以为程序坏了。 */
 	char audio_err[56];
-	u64 start_ms, pause_t0;
+	PlaybackClock fallback_clock; /* Worker-owned source/content seconds. */
+	volatile int speed;          /* Main publishes 100/125/150/200. */
 
 	double duration;
 	double cur_pts;
@@ -195,7 +203,12 @@ typedef struct {
 	/* 线程通信(volatile,单生产者单消费者) */
 	volatile int quit;          /* 主线程 → worker:退出 */
 	volatile int pause;         /* 主线程 → worker:暂停请求 */
+	volatile int pause_applied; /* Worker acknowledges modal/user pauses. */
 	volatile int worker_done;   /* worker → 主线程:已结束 */
+	volatile int read_error;    /* A demux/read failure is never a natural EOF. */
+	volatile int decode_error;  /* First real codec/resampler error, retained to exit. */
+	bool network_error;
+	bool user_back;
 	volatile u32 clock_ms;      /* worker 发布的播放时钟(毫秒) */
 	volatile int mb_full;       /* 邮箱:有帧待呈现 */
 	volatile u32 mb_pts_ms;     /* 邮箱:帧时间戳(毫秒) */
@@ -213,6 +226,7 @@ typedef struct {
 	volatile double seek_to;    /* 跳转目标(秒) */
 	volatile double disp_pts;   /* 拖动时显示用的位置(秒) */
 	bool clock_resync;          /* seek 后用首个音频帧 pts 校准时钟 */
+	double audio_seek_target;   /* Video may reach/clear seek_skip before audio. */
 	double seek_skip;           /* 精确 seek:丢弃此时刻之前的音视频帧(0=无) */
 	/* 解码器**原地热切换**(不重开整个播放,不丢失进度)。
 	 * 只在 seek 处理里执行 —— 那里本来就要冲刷解复用/解码器/音频队列,
@@ -231,6 +245,13 @@ typedef struct {
 	int mvd_inited;             /* mvdstdInit 已成功(与 use_mvd 无关) */
 	u64 osd_until;              /* 上屏角标显示截止时间(仅主线程使用) */
 } Player;
+
+static bool codec_failed(Player *p, int status, bool draining) {
+	if (!playback_codec_failed(status, AVERROR(EAGAIN), AVERROR_EOF, draining))
+		return false;
+	if (!p->decode_error) p->decode_error = status;
+	return true;
+}
 
 static Player s_player;
 /* 硬解降级是**每个视频重新判定**的,不是一降到底。
@@ -266,6 +287,22 @@ static u32 s_player_clock_ms = 0;   /* 供退出时补报进度 */
 static char s_toast[128] = "";      /* 上屏浮层提示(发弹幕结果等) */
 static u64  s_toast_until = 0;
 static bool (*s_login_cb)(void) = NULL;
+static void (*s_actions_cb)(void) = NULL;
+static void (*s_up_cb)(void) = NULL;
+typedef void (*PlayerModalCallback)(void);
+static PlayerModalCallback player_modal_callback(PlaybackModal modal) {
+	return modal == PLAYBACK_MODAL_ACTIONS ? s_actions_cb :
+		modal == PLAYBACK_MODAL_UP ? s_up_cb : NULL;
+}
+static PlayerStartOptions s_start_options;
+static PlayerResult s_session_result;
+static bool s_result_explicit;
+static bool s_in_actions, s_navigation_requested;
+void player_request_navigation(void) {
+	if (s_in_actions) s_navigation_requested = true;
+}
+void player_set_actions_cb(void (*cb)(void)) { s_actions_cb = cb; }
+void player_set_up_cb(void (*cb)(void)) { s_up_cb = cb; }
 
 /* ---------- 分 P ----------
  * 【为什么选集在播放器**里面**】
@@ -282,6 +319,30 @@ static const int         *s_pg_durs   = NULL;
 static int  s_pg_n   = 0;      /* 共几 P(<=1 不显示选集) */
 static int  s_pg_cur = 0;      /* 当前是第几 P(下标) */
 static int  s_page_pick = -1;  /* 用户选中的下标;-1 = 没选 */
+static PlayerNavigation s_navigation;
+
+void player_set_navigation(PlayerNavigationKind kind,bool previous,bool next) {
+	s_navigation=(PlayerNavigation){kind,previous,next};
+}
+
+static int player_neighbor_buttons(bool touched,float tx,float ty) {
+	static const char *labels[][2]={{"上一 P","下一 P"},{"上一集","下一集"},{"上一条","下一条"}};
+	unsigned kind=(unsigned)s_navigation.kind;
+	if(kind>PLAYER_NAV_ITEMS)kind=PLAYER_NAV_PAGES;
+	int hit=0;
+	for(int i=0;i<2;i++) {
+		float x=i?210:106,w=i?100:98;
+		bool available=i?s_navigation.next:s_navigation.previous;
+		if(available) {
+			if(ui_button(x,150,w,28,labels[kind][i],UI_COL_SEL,touched,tx,ty))hit=i?1:-1;
+		} else {
+			ui_rect(x,150,w,28,UI_COL_SEL);
+			float tw=ui_text_width(labels[kind][i],UI_SHARP),th=ui_text_height(UI_SHARP);
+			ui_text(x+(w-tw)/2,150+(28-th)/2,UI_SHARP,UI_COL_DIM,labels[kind][i]);
+		}
+	}
+	return hit;
+}
 
 void player_set_pages(const char *const *labels, const int *durations,
                       int n, int cur) {
@@ -289,6 +350,7 @@ void player_set_pages(const char *const *labels, const int *durations,
 	s_pg_durs   = durations;
 	s_pg_n      = n;
 	s_pg_cur    = cur;
+	player_set_navigation(PLAYER_NAV_PAGES,cur>0,cur+1<n);
 }
 
 /* 本次播放是不是**自然播到结尾**(而不是用户按 B 退出 / 换 P / 出错)。
@@ -629,11 +691,15 @@ static bool audio_init(Player *p) {
 	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 	ndspChnReset(0);
 	ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-	ndspChnSetRate(0, (float)SAMPLE_RATE);
+	/* Tempo changes PCM duration; playback frequency always stays fixed. */
+	ndspChnSetRate(0, SAMPLE_RATE);
 	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 	p->abuf = (s16 *)linearAlloc(AUDIO_NBUFS * AUDIO_SAMPLES_PER_BUF * 2 * sizeof(s16));
-	if (!p->abuf) {
+	p->tempo = audio_tempo_create();
+	if (!p->abuf || !p->tempo) {
 		snprintf(p->audio_err, sizeof(p->audio_err), "无声音:内存不足");
+		/* Report a real playback failure instead of substituting pitch shift. */
+		p->decode_error = AVERROR(ENOMEM);
 		ndspExit(); p->ndsp_ok = false; return false;
 	}
 	memset(p->wbuf, 0, sizeof(p->wbuf));
@@ -655,19 +721,52 @@ static bool audio_init(Player *p) {
  * 顺序也不能反:必须先停通道、再放缓冲。 */
 static void audio_exit(Player *p) {
 	if (p->ndsp_ok) {
+		ndspChnWaveBufClear(1);
+		ndspChnReset(1);
 		ndspChnWaveBufClear(0);   /* 先把队列里指向 abuf 的 wavebuf 摘掉 */
 		ndspChnReset(0);
 		ndspExit();
 		p->ndsp_ok = false;
 	}
 	p->audio_ok = false;
+	audio_tempo_destroy(p->tempo); p->tempo = NULL;
 	if (p->abuf) { linearFree(p->abuf); p->abuf = NULL; }
+	if (p->shot_pcm) { linearFree(p->shot_pcm); p->shot_pcm = NULL; }
+}
+
+/* Optional acknowledgement only after the SD writer reports success. PCM and
+ * wave storage survive playback; stop channel 1 before freeing in audio_exit. */
+static void screenshot_chime(Player *p) {
+	if (!p->ndsp_ok) return;
+	const int count = 2205;
+	if (!p->shot_pcm) {
+		p->shot_pcm = linearAlloc(count * sizeof(s16));
+		if (!p->shot_pcm) return;
+		for (int i = 0; i < count; i++) {
+			double envelope = sin(3.141592653589793 * i / count);
+			p->shot_pcm[i] = (s16)(6000 * envelope *
+				sin(2 * 3.141592653589793 * 880 * i / 22050.0));
+		}
+		DSP_FlushDataCache(p->shot_pcm, count * sizeof(s16));
+	}
+	ndspChnWaveBufClear(1);
+	ndspChnReset(1);
+	ndspChnSetInterp(1, NDSP_INTERP_LINEAR);
+	ndspChnSetRate(1, 22050.0f);
+	ndspChnSetFormat(1, NDSP_FORMAT_MONO_PCM16);
+	float mix[12] = { 1.0f, 1.0f };
+	ndspChnSetMix(1, mix);
+	memset(&p->shot_wave, 0, sizeof(p->shot_wave));
+	p->shot_wave.data_vaddr = p->shot_pcm;
+	p->shot_wave.nsamples = count;
+	ndspChnWaveBufAdd(1, &p->shot_wave);
 }
 
 static void audio_reap(Player *p) {
 	for (int i = 0; i < AUDIO_NBUFS; i++) {
 		if (p->wbuf[i].status == NDSP_WBUF_DONE && p->wbuf[i].nsamples) {
-			p->samples_done += p->wbuf[i].nsamples;
+			double end = p->audio_start[i] + p->audio_duration[i];
+			if (end > p->audio_completed_seconds) p->audio_completed_seconds = end;
 			p->wbuf[i].nsamples = 0;
 		}
 	}
@@ -678,26 +777,53 @@ static bool audio_have_free(Player *p) {
 	       p->wbuf[p->next_wbuf].status == NDSP_WBUF_FREE;
 }
 
-static void audio_submit(Player *p) {
-	if (p->pending_n < AUDIO_SAMPLES_PER_BUF || !audio_have_free(p))
-		return;
-	ndspWaveBuf *w = &p->wbuf[p->next_wbuf];
-	s16 *dst = (s16 *)w->data_vaddr;
-	memcpy(dst, p->pending, AUDIO_SAMPLES_PER_BUF * 2 * sizeof(s16));
-	memmove(p->pending, p->pending + AUDIO_SAMPLES_PER_BUF * 2,
-	        (size_t)(p->pending_n - AUDIO_SAMPLES_PER_BUF) * 2 * sizeof(s16));
-	p->pending_n -= AUDIO_SAMPLES_PER_BUF;
-	w->nsamples = AUDIO_SAMPLES_PER_BUF;
-	DSP_FlushDataCache(dst, AUDIO_SAMPLES_PER_BUF * 2 * sizeof(s16));
-	ndspChnWaveBufAdd(0, w);
-	p->next_wbuf = (p->next_wbuf + 1) % AUDIO_NBUFS;
+static void audio_submit_samples(Player *p, bool final) {
+	(void)final; /* EOF belongs to the resampler, then audio_tempo_finish. */
+	if (!p->audio_ok || !p->tempo) return;
+	/* pending contains original resampled PCM, never already stretched PCM.
+	 * A full NDSP queue applies backpressure through both bounded queues. */
+	if (p->pending_n > 0) {
+		size_t accepted = audio_tempo_push(p->tempo, p->pending, p->pending_n);
+		p->pending_n -= accepted;
+		memmove(p->pending, p->pending + accepted * 2,
+		        (size_t)p->pending_n * 2 * sizeof(s16));
+	}
+	while (audio_have_free(p)) {
+		audio_reap(p); /* A DONE slot's clock must be recorded before reuse. */
+		int index = p->next_wbuf;
+		ndspWaveBuf *w = &p->wbuf[index];
+		s16 *dst = (s16 *)w->data_vaddr;
+		double source_frames;
+		size_t count = audio_tempo_read(p->tempo, dst, AUDIO_SAMPLES_PER_BUF,
+			playback_speed(p->speed), &source_frames);
+		if (!count) break;
+		/* Keep each grain's original duration, including a fractional EOF
+		 * tail. Queued grains retain the speed at which they were generated. */
+		p->audio_start[index] = p->audio_queued_seconds;
+		p->audio_duration[index] = source_frames / SAMPLE_RATE;
+		p->audio_queued_seconds += p->audio_duration[index];
+		w->nsamples = count;
+		DSP_FlushDataCache(dst, count * 2 * sizeof(s16));
+		ndspChnWaveBufAdd(0, w);
+		p->next_wbuf = (index + 1) % AUDIO_NBUFS;
+	}
 }
+
+static void audio_submit(Player *p) { audio_submit_samples(p, false); }
 
 static double audio_clock(Player *p) {
 	if (!p->audio_ok)
-		return (double)(osGetTime() - p->start_ms) / 1000.0;
-	/* 已播完整块 + 当前块内的采样进度,精度从 ~62ms 提到采样级 */
-	return (double)(p->samples_done + ndspChnGetSamplePos(0)) / (double)SAMPLE_RATE;
+		return p->fallback_clock.seconds;
+	/* Sample position is an OUTPUT offset. Convert it through the playing
+	 * grain's metadata, never through the newly requested speed. */
+	for (int i = 0; i < AUDIO_NBUFS; i++) {
+		ndspWaveBuf *w = &p->wbuf[i];
+		if (w->status != NDSP_WBUF_PLAYING || !w->nsamples) continue;
+		u32 position = ndspChnGetSamplePos(0);
+		if (position > w->nsamples) position = w->nsamples;
+		return p->audio_start[i] + p->audio_duration[i] * position / w->nsamples;
+	}
+	return p->audio_completed_seconds;
 }
 
 static int audio_free_bufs(Player *p) {
@@ -712,45 +838,74 @@ static int audio_free_bufs(Player *p) {
 
 /* pending 还能不能装下一帧音频(AAC 一帧最多 2048 采样) */
 static bool audio_has_room(const Player *p) {
-	return PENDING_CAP - p->pending_n >= 2048;
+	return !p->audio_ok || (p->pending_n == 0 && audio_tempo_space(p->tempo) >= 2048);
 }
 
-static void audio_feed(Player *p, AVPacket *pkt) {
-	if (!p->audio_ok || !p->adec) return;
-	if (avcodec_send_packet(p->adec, pkt) < 0) return;
+static int audio_feed(Player *p, AVPacket *pkt, bool *consumed) {
+	if (consumed) *consumed = false;
+	if (!p->audio_ok || !p->adec) return AVERROR_EOF;
+	int sent = avcodec_send_packet(p->adec, pkt);
+	if (consumed) *consumed = sent >= 0;
+	if (codec_failed(p, sent, pkt == NULL)) return sent;
 	/* 关键:空间不足就停止取帧,让帧留在解码器内部排队。
 	 * 原来无条件 receive+convert,pending 满时 swr_convert(space=0)
 	 * 会把这一帧**直接丢掉** —— 音频缺一段而视频不缺,就是永久性
 	 * 音画不同步(长时间缓冲/等弹幕时最容易触发) */
-	while (audio_has_room(p) && avcodec_receive_frame(p->adec, p->aframe) == 0) {
+	int received = AVERROR(EAGAIN);
+	while (audio_has_room(p) &&
+	       (received = avcodec_receive_frame(p->adec, p->aframe)) == 0) {
+		double frame_start = -1.0;
 		if (p->clock_resync) {
 			int64_t ts = p->aframe->best_effort_timestamp;
 			if (ts == AV_NOPTS_VALUE) ts = p->aframe->pts;
 			if (ts != AV_NOPTS_VALUE && p->astream >= 0) {
-				double t = ts * av_q2d(p->fmt->streams[p->astream]->time_base);
-				/* 精确 seek:目标之前的音频帧直接丢,不进播放队列 */
-				if (p->seek_skip > 0.0 && t + 0.03 < p->seek_skip)
+				frame_start = ts * av_q2d(p->fmt->streams[p->astream]->time_base);
+				/* Skip complete pre-target frames, then trim the overlapping
+				 * frame below rather than moving a seek backwards by ~30ms. */
+				double length = (double)p->aframe->nb_samples / p->adec->sample_rate;
+				if (p->audio_seek_target > 0.0 && frame_start + length <= p->audio_seek_target)
 					continue;
-				p->samples_done = (u64)(t * SAMPLE_RATE);
-				p->start_ms = osGetTime() - (u64)(t * 1000.0);
-				/* 一起打出「本来想去哪」:seek 时是目标位置,起播时是 0。
-				 * 两个数应该接近。差一大截 = 音频时间戳基准和视频对不上,
-				 * 之后每一帧在主线程看来都「迟到」了那么多,追帧空转、
-				 * 画面掉帧而声音完全正常——这种症状很难从现象反推,
-				 * 所以在源头就记下来 */
-				printf("clock sync %dms (want %dms)\n",
-				       (int)(t * 1000.0), (int)(p->seek_skip * 1000.0));
 			}
-			p->clock_resync = false;
 		}
 		s16 *out = p->pending + p->pending_n * 2;
 		int space = (int)(sizeof(p->pending) / (2 * sizeof(s16))) - p->pending_n;
+		/* Never consume a decoded frame into an undersized resampler buffer.
+		 * AAC output fits this bound; reject an abnormal format truthfully. */
+		int required = swr_get_out_samples(p->swr, p->aframe->nb_samples);
+		if (required < 0 || required > space) {
+			p->decode_error = required < 0 ? required : AVERROR(ENOMEM);
+			return p->decode_error;
+		}
 		uint8_t *outp[1] = { (uint8_t *)out };
 		int got = swr_convert(p->swr, outp, space,
 		                      (const uint8_t **)p->aframe->data, p->aframe->nb_samples);
+		if (codec_failed(p, got, false)) return got;
+		if (got > 0 && p->clock_resync) {
+			double start = frame_start >= 0.0 ? frame_start : p->audio_seek_target;
+			int trim = 0;
+			if (start < p->audio_seek_target) {
+				double skip = (p->audio_seek_target - start) * SAMPLE_RATE;
+				trim = (int)skip;
+				if (trim < skip) trim++;
+				if (trim > got) trim = got;
+				start += (double)trim / SAMPLE_RATE;
+				got -= trim;
+				memmove(out, out + trim * 2, (size_t)got * 2 * sizeof(s16));
+			}
+			if (got > 0) {
+				p->audio_completed_seconds = p->audio_queued_seconds = start;
+				playback_clock_reset(&p->fallback_clock, osGetTime(), start,
+					p->speed, p->pause || p->buffering);
+				printf("clock sync %dms (want %dms)\n",
+				       (int)(start * 1000.0), (int)(p->audio_seek_target * 1000.0));
+				p->clock_resync = false;
+			}
+		}
 		if (got > 0) p->pending_n += got;
 		audio_submit(p);
 	}
+	codec_failed(p, received, pkt == NULL);
+	return received;
 }
 
 /* ---------- 呈现(主线程,GPU 合成:视频纹理 + 弹幕 + OSD) ---------- */
@@ -1328,6 +1483,7 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 	 * 要等下一个 IDR 才自己好。
 	 * 两个解码器吃同一串包却只有一个出问题,差别就在这儿。 */
 	if (p->mvd_wait_key) {
+		if (!pkt) return 0;
 		/* 回 MVD_CONSUMED 而不是 0:0 会让调用方以为"没吃下"而把包塞回
 		 * 队列重试 8 次 —— 这些包我们是**故意**不要的,重试纯属空转。 */
 		if (!(pkt->flags & AV_PKT_FLAG_KEY)) return MVD_CONSUMED;
@@ -1340,7 +1496,7 @@ static int mvd_decode_packet(Player *p, AVPacket *pkt) {
 	MVDSTD_SetConfig(&p->mvd_cfg);
 
 	for (int attempt = 0; attempt < 2; attempt++) {
-		if (!p->mvd_skip) {
+		if (!p->mvd_skip && pkt) {
 			/* avcC(4 字节大端长度 + NAL)→ annex-b,整包一次送入 */
 			u32 off = 0, so = 0;
 			const u8 *d = pkt->data;
@@ -1701,10 +1857,16 @@ static bool y2r_finish(Player *p, u16 *dst) {
 	return true;
 }
 
-static bool sw_decode(Player *p, AVPacket *pkt, double *pts_out) {
+static bool sw_decode(Player *p, AVPacket *pkt, double *pts_out, bool *consumed) {
 	u64 t0 = svcGetSystemTick();
-	bool decoded = (avcodec_send_packet(p->vdec, pkt) >= 0) &&
-	               (avcodec_receive_frame(p->vdec, p->vframe) == 0);
+	/* NULL drains delayed frames. After the first NULL the codec can return
+	 * EOF from send while receive still has a frame, so always receive. */
+	int sent = avcodec_send_packet(p->vdec, pkt);
+	if (consumed) *consumed = sent >= 0;
+	if (codec_failed(p, sent, pkt == NULL)) return false;
+	int received = avcodec_receive_frame(p->vdec, p->vframe);
+	if (codec_failed(p, received, pkt == NULL)) return false;
+	bool decoded = received == 0;
 	u64 t1 = svcGetSystemTick();
 	s_sw_dec_t += t1 - t0;
 
@@ -1858,9 +2020,10 @@ static int video_decode_pkt(Player *p, AVPacket *pkt, double *pts_out,
 		}
 		return r;
 	}
-	bool got = sw_decode(p, pkt, pts_out);
-	(*au_count)++;
-	return (got ? MVD_GOT_FRAME : 0) | MVD_CONSUMED;
+	bool consumed = false;
+	bool got = sw_decode(p, pkt, pts_out, &consumed);
+	if (consumed) (*au_count)++;
+	return (got ? MVD_GOT_FRAME : 0) | (consumed ? MVD_CONSUMED : 0);
 }
 
 /* ---------- worker 线程:拉流 + 解码 + 音频 ---------- */
@@ -1871,30 +2034,42 @@ static void worker_main(void *arg) {
 	static AVPacket *vq[VQ_CAP];
 	int vq_head = 0, vq_len = 0;
 	bool eof = false, applied_pause = false;
+	bool video_drained = false, audio_drained = false;
+	bool audio_packet_pending = false;
 	int au_count = 0, mvd_frames = 0;
 	int noframe_run = 0;      /* 连续多少个包没解出帧(解码侧卡顿探针) */
 	int pkt_retry = 0;        /* 同一个包已重投几次(上限,防原地打转) */
 	int vqfull_drops = 0;     /* 队列满时「解了就扔」发生了几次 */
 	double vclock_fallback = 0.0;
 	double clock_hold = 0.0;          /* 单调化用的上一次时钟 */
+	bool initial_seek = playback_resume_seconds(s_start_options.start_seconds) > 0.0;
+	if (initial_seek) {
+		p->seek_to = playback_resume_seconds(s_start_options.start_seconds);
+		if (p->duration > 0 && p->seek_to > p->duration) p->seek_to = p->duration;
+		p->seek_req = 1;
+	}
 
 	p->buffering = 1;                 /* 起播先攒缓冲 */
 	p->seek_skip = 0.0;
 	bool waiting_danmaku = true;      /* 首次起播时顺带等弹幕就绪 */
-	bool need_frame = false;          /* 暂停中 seek 后:解出一帧就停 */
+	bool need_frame = p->pause != 0;  /* Paused page changes still get one silent preview. */
 	u64 dm_wait_since = osGetTime();  /* 兜底上限,见下 */
 /* 等弹幕的硬上限。原来 20 秒太长:期间画面卡在"载入弹幕…",
  * 用户以为死机;而且缓冲态越久,音频缓冲越容易满(见 audio_feed) */
 #define DM_WAIT_MAX 6000
 	while (!p->quit) {
+		if (p->decode_error) { p->ret = p->decode_error; break; }
 		/* 暂停 = 用户暂停 或 缓冲中(NDSP 调用留在本线程) */
-		bool want_pause = (p->pause != 0) || (p->buffering != 0);
+		bool requested_pause = p->pause != 0;
+		bool want_pause = requested_pause || (p->buffering != 0);
+		/* NDSP stays at the source output rate; WSOLA changes duration only. */
+		int rate = playback_speed(p->speed);
+		playback_clock_update(&p->fallback_clock, osGetTime(), rate, want_pause);
 		if (want_pause != applied_pause) {
 			applied_pause = want_pause;
 			if (p->audio_ok) ndspChnSetPaused(0, applied_pause);
-			if (applied_pause) p->pause_t0 = osGetTime();
-			else p->start_ms += osGetTime() - p->pause_t0;
 		}
+		p->pause_applied = requested_pause;
 		/* 暂停时也必须响应 seek(挂着不处理的话,进度条会弹回旧位置,
 		 * 等恢复播放才突然跳过去);seek 后还要解出一帧上屏(need_frame),
 		 * 让暂停画面立刻变成新位置的画面 */
@@ -1920,6 +2095,8 @@ static void worker_main(void *arg) {
 					svcSleepThread(100 * 1000 * 1000LL);
 			}
 			if (seek_ok >= 0) {
+				if (audio_packet_pending) av_packet_unref(pkt);
+				audio_packet_pending = false;
 				/* 清空视频包队列(释放后置空,杜绝悬垂指针) */
 				while (vq_len > 0) {
 					if (vq[vq_head]) av_packet_free(&vq[vq_head]);
@@ -1993,14 +2170,12 @@ static void worker_main(void *arg) {
 					}
 				}
 				/* 丢弃已排队音频,重置时钟到目标位置。
-				 * 关键:必须 ndspChnReset 让通道的采样位置计数归零——
-				 * 音频时钟 = samples_done + ndspChnGetSamplePos(),只清前者
-				 * 会让每次跳转都累加一次残留位置,越拖越不同步 */
+				 * 清通道和变速器,完成块/排队块一起重置到目标内容时间。 */
 				if (p->audio_ok) {
 					ndspChnWaveBufClear(0);
 					ndspChnReset(0);
 					ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-					ndspChnSetRate(0, (float)SAMPLE_RATE);
+					ndspChnSetRate(0, SAMPLE_RATE);
 					ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 					for (int i = 0; i < AUDIO_NBUFS; i++) {
 						memset(&p->wbuf[i], 0, sizeof(p->wbuf[i]));
@@ -2011,9 +2186,11 @@ static void worker_main(void *arg) {
 					applied_pause = false; /* Reset 清了暂停态,下轮重新应用 */
 				}
 				p->pending_n = 0;
+				audio_tempo_reset(p->tempo);
 				pkt_retry = 0;
 				noframe_run = 0;
-				p->samples_done = (u64)(tgt * SAMPLE_RATE);
+				p->audio_completed_seconds = p->audio_queued_seconds = tgt;
+				p->audio_seek_target = tgt;
 				p->clock_resync = true;  /* 首个"目标后"音频帧到达时校准 */
 				/* 精确 seek:av_seek 落在目标前最近的关键帧(可能早好几秒),
 				 * 若按老办法把时钟校准到关键帧 pts,进度条就会肉眼可见地
@@ -2029,9 +2206,11 @@ static void worker_main(void *arg) {
 				}
 				p->mvd_wait_key = true;   /* 硬解:等关键帧再开送,见 mvd_decode_packet */
 				p->seek_skip = tgt;
-				p->start_ms = osGetTime() - (u64)(tgt * 1000.0);
+				playback_clock_reset(&p->fallback_clock, osGetTime(), tgt, rate, true);
 				p->mb_full = 0;
 				eof = false;
+				video_drained = audio_drained = false;
+				p->read_error = 0;
 				p->dbg_eof = 0;
 				vclock_fallback = tgt;
 				p->buffering = 1;   /* 跳转后重新攒缓冲 */
@@ -2039,6 +2218,12 @@ static void worker_main(void *arg) {
 				p->clock_ms = (u32)(tgt * 1000.0);
 				clock_hold = tgt;
 				if (p->pause) need_frame = true; /* 暂停画面也要跳到新位置 */
+				initial_seek = false;
+			} else if (initial_seek) {
+				/* A quality reopen must never silently restart from zero. */
+				p->read_error = p->ret = seek_ok;
+				p->seek_req = 0;
+				break;
 			}
 			__dmb();
 			p->seek_req = 0;
@@ -2048,7 +2233,7 @@ static void worker_main(void *arg) {
 		audio_reap(p);
 		audio_submit(p);
 		{	/* 音频时钟单调化:一个 wavebuf 播完到被 reap 之间,
-			 * ndspChnGetSamplePos 已归零而 samples_done 还没加上去,
+			 * ndspChnGetSamplePos 已归零而完成块还没被回收,
 			 * 时钟会瞬间倒退最多 62ms → 弹幕/画面"一错一错"。
 			 * 小幅倒退(<300ms)按住不放,大跳(seek/重置)才接受 */
 			double c = audio_clock(p);
@@ -2153,6 +2338,20 @@ static void worker_main(void *arg) {
 		 * 上限 8 个包:再多就轮不到解码,画面反而先停了。 */
 		int read_burst = 0;
 		do {
+		/* EAGAIN asks us to receive queued decoder output and retry this
+		 * same packet. Never discard it or read a new packet over it. */
+		if (audio_packet_pending) {
+			if (audio_has_room(p)) {
+				bool consumed = false;
+				audio_feed(p, pkt, &consumed);
+				if (consumed || p->decode_error) {
+					av_packet_unref(pkt);
+					audio_packet_pending = false;
+				}
+				did = true;
+			}
+			break;
+		}
 		/* 音频没空间时一律不读:读到的若是音频包就会被丢弃(见 audio_feed)。
 		 * 原条件里 "vq_len < VQ_CAP/2" 这一支会绕过音频空间检查。
 		 * 放在循环**内**:连读时每一轮都要重新判断,拿上一轮的旧值
@@ -2166,10 +2365,16 @@ static void worker_main(void *arg) {
 			did = true;
 			if (r < 0) {
 				eof = true;
-				p->dbg_eof = 1;
+				p->dbg_eof = r == AVERROR_EOF && !p->ring.err && !p->quit;
+				if (!p->dbg_eof && !p->quit) {
+					p->read_error = r;
+					p->network_error = p->ring.err || r == AVERROR(EIO);
+				}
 			} else if (pkt->stream_index == p->astream) {
-				audio_feed(p, pkt);
-				av_packet_unref(pkt);
+				bool consumed = false;
+				audio_feed(p, pkt, &consumed);
+				audio_packet_pending = !consumed && !p->decode_error && p->audio_ok;
+				if (!audio_packet_pending) av_packet_unref(pkt);
 			} else if (pkt->stream_index == p->vstream) {
 				if (vq_len == VQ_CAP) {
 					/* 队列满:解掉最老的包保持参考链,不呈现。
@@ -2399,14 +2604,53 @@ static void worker_main(void *arg) {
 
 		if (eof) {
 			need_frame = false;   /* 片尾解不出新帧,别为它空转 */
+			/* Flush delayed decoder samples and the last partial PCM buffer.
+			 * A demux failure is retained after draining, never promoted to EOF. */
+			if (p->audio_ok && !audio_drained && audio_has_room(p)) {
+				int ar = audio_feed(p, NULL, NULL);
+				/* AAC normally has no delayed frame; drain swresample too. */
+				if (ar == AVERROR_EOF) {
+					uint8_t *out[1] = { (uint8_t *)(p->pending + p->pending_n * 2) };
+					int got = swr_convert(p->swr, out, PENDING_CAP - p->pending_n, NULL, 0);
+					codec_failed(p, got, false);
+					if (got > 0) p->pending_n += got;
+					else {
+						audio_drained = true;
+						audio_tempo_finish(p->tempo);
+					}
+				} else if (ar < 0 && ar != AVERROR(EAGAIN)) {
+					p->read_error = ar;
+					audio_drained = true;
+				}
+			}
+			if (p->audio_ok) audio_submit_samples(p, true);
+			if (!p->mb_full && vq_len == 0 && !video_drained) {
+				if (p->vdec) p->vdec->skip_frame = AVDISCARD_DEFAULT;
+				double tail_pts = -1.0;
+				bool tail = p->use_mvd
+					? (video_decode_pkt(p, NULL, &tail_pts, &au_count, &mvd_frames) & MVD_GOT_FRAME) != 0
+					: sw_decode(p, NULL, &tail_pts, NULL);
+				if (tail) {
+					if (tail_pts < 0) tail_pts = vclock_fallback;
+					p->mb_buf = p->back;
+					p->mb_pts_ms = (u32)(tail_pts * 1000.0);
+					p->mb_gen = p->seek_gen;
+					p->back ^= 1;
+					__dmb();
+					p->mb_full = 1;
+					p->dbg_decoded++;
+				} else video_drained = !p->y2r_busy;
+			}
 			audio_reap(p);
 			bool drained = true;
 			for (int i = 0; i < AUDIO_NBUFS; i++)
 				if (p->wbuf[i].status == NDSP_WBUF_QUEUED ||
 				    p->wbuf[i].status == NDSP_WBUF_PLAYING)
 					drained = false;
-			if (vq_len == 0 && !p->mb_full && drained) {
-				p->ret = 0;
+			if (vq_len == 0 && !p->mb_full && video_drained && drained &&
+			    (!p->audio_ok || (audio_drained && p->pending_n == 0 && audio_tempo_drained(p->tempo)))) {
+				p->ret = p->decode_error ? p->decode_error : p->read_error ? p->read_error
+					: p->dbg_decoded ? 0 : AVERROR_INVALIDDATA;
 				break;
 			}
 		}
@@ -2453,6 +2697,19 @@ static void player_cleanup(Player *p) {
 static int player_play_inner(const char *url, const char *title);
 
 int player_play(const char *url, const char *title) {
+	PlayerStartOptions options = { .paused = false, .has_next = s_pg_cur + 1 < s_pg_n };
+	return player_play_session(url, title, options).error_code;
+}
+
+PlayerResult player_play_session(const char *url, const char *title,
+                                PlayerStartOptions options) {
+	s_start_options = options;
+	s_session_result = (PlayerResult){ .reason = PLAYER_DECODE_ERROR, .page_index = -1, .paused = options.paused };
+	s_in_actions = false;
+	s_navigation_requested = false;
+	s_result_explicit = false;
+	s_ended_eof = false;
+	s_suspend_req = 0;
 	/* 【进来先清】没清的话,上一次没被消费掉的选集结果会活到这一次,
 	 * 一进播放就自己退出去换 P。s_suspend_req 刚犯过同样的错:
 	 * 一个只在某处消费的标志,必须在每次进入那个上下文时归零。 */
@@ -2467,7 +2724,19 @@ int player_play(const char *url, const char *title) {
 	} else {
 		s_disable_mvd = false;
 	}
-	return player_play_inner(url, title);
+	int code = player_play_inner(url, title);
+	if (net_is_shutting_down() || aptShouldClose()) {
+		s_session_result = (PlayerResult){ .reason = PLAYER_SYSTEM_EXIT, .page_index = -1, .paused = true };
+	} else if (!s_result_explicit) {
+		s_session_result.reason = playback_terminal_reason(
+			net_is_shutting_down() || aptShouldClose(), s_player.user_back,
+			s_page_pick, s_player.dbg_eof != 0, s_player.network_error, code);
+		s_session_result.paused = s_player.pause != 0;
+		s_session_result.error_code = code < 0 ? code : 0;
+		if (s_session_result.reason == PLAYER_BACK) s_session_result.error_code = 0;
+	}
+	s_ended_eof = s_session_result.reason == PLAYER_FINISHED;
+	return s_session_result;
 }
 
 
@@ -2512,6 +2781,7 @@ static int run_open(Player *p, int (*fn)(Player *), const char *msg,
 		hidScanInput();
 		if (!cancelling && (hidKeysDown() & KEY_B)) {
 			cancelling = true;
+			p->user_back = true;
 			p->quit = 1;              /* 读回调看到它就返回错误 */
 			p->ring.quit = 1;
 			net_cancel_streams();     /* 掐掉在途的那次请求 */
@@ -2538,8 +2808,10 @@ static int run_open(Player *p, int (*fn)(Player *), const char *msg,
 }
 
 static int demux_open_job(Player *p) {
-	if (avformat_open_input(&p->fmt, NULL, NULL, NULL) < 0) return -1;
-	if (avformat_find_stream_info(p->fmt, NULL) < 0) return -2;
+	int r = avformat_open_input(&p->fmt, NULL, NULL, NULL);
+	if (r < 0) return r;
+	r = avformat_find_stream_info(p->fmt, NULL);
+	if (r < 0) return r;
 	return 0;
 }
 
@@ -2550,7 +2822,10 @@ static int ns_open_job(Player *p) { return ns_open(&p->ns, s_open_url, 0); }
 static int player_play_inner(const char *url, const char *title) {
 	Player *p = &s_player;
 	memset(p, 0, sizeof(*p));
+	p->speed = playback_speed(settings_get("play_speed", 100));
 	p->vstream = p->astream = -1;
+	p->pause = s_start_options.paused;
+	p->clock_ms = s_player_clock_ms = (u32)(playback_resume_seconds(s_start_options.start_seconds) * 1000.0);
 	p->ret = -1;
 	int ret = -1;
 	Thread dl_th = NULL;
@@ -2574,7 +2849,8 @@ static int player_play_inner(const char *url, const char *title) {
 	/* ns_open 只做 HTTP:重定向每层约 2KB 栈,32KB 够用 */
 	if (run_open(p, ns_open_job, "连接中", 32 * 1024) != 0) {
 		printf("stream open failed (or cancelled)\n");
-		return -1;
+		p->network_error = !p->user_back;
+		goto done;
 	}
 
 	/* 启动下载线程(独占网络连接,持续填充环形缓冲) */
@@ -2638,8 +2914,11 @@ static int player_play_inner(const char *url, const char *title) {
 	s_io_seek_ms = 0;
 	u64 t_open = osGetTime();
 	/* find_stream_info 要开解码器解几帧,栈按 worker 的量级给 */
-	if (run_open(p, demux_open_job, "载入视频", WORKER_STACK) != 0) {
+	int open_code = run_open(p, demux_open_job, "载入视频", WORKER_STACK);
+	if (open_code != 0) {
 		printf("demux open failed (or cancelled)\n");
+		ret = open_code;
+		p->network_error = p->ring.err || open_code == AVERROR(EIO);
 		goto done;
 	}
 	u64 t_info = osGetTime();
@@ -2789,7 +3068,8 @@ static int player_play_inner(const char *url, const char *title) {
 	sub_set_size(s_sub_size);
 	s_pref_3d = 0;          /* 每个视频默认 2D,要 3D 手动开 */
 	ui_set_3d(false);
-	p->start_ms = osGetTime();
+	playback_clock_reset(&p->fallback_clock, osGetTime(),
+		playback_resume_seconds(s_start_options.start_seconds), p->speed, true);
 
 	/* 启动 worker:优先 New3DS 附加核心 */
 	{
@@ -2849,6 +3129,11 @@ static int player_play_inner(const char *url, const char *title) {
 		bool in_psettings = false;   /* 播放设置子页 */
 		bool in_comments = false;   /* 评论区子页(视频照常播) */
 		bool in_pages = false;      /* 选集子页(视频暂停,上屏留住画面) */
+		bool pages_paused = false;  /* Intent captured before entering the picker. */
+		bool ended = false;
+		PlaybackInput input = {0};
+		int saved_speed = p->speed;
+		double queued_seek = -1.0; /* Held LR accumulates while an HTTP seek runs. */
 		/* 【选集是纯触屏页】滚动改成像素级,靠手指拖 —— 按行翻页在
 		 * 上百 P 的合集里要点几十次。摇杆和十字键在这一页**不接管**:
 		 * 它们在播放页是别的用途(方向键调进度、摇杆没占用),
@@ -2878,16 +3163,8 @@ static int player_play_inner(const char *url, const char *title) {
 		u32 last_clock_ms_seen = 0xFFFFFFFFu;
 		u64 last_clock_move = 0;
 
-		/* 【进播放器先清挂起请求】
-		 * s_suspend_req 由 APT 钩子置位,但**只有这个循环会消费它**。
-		 * 在列表页按 HOME、或者启动时系统发的挂起事件,都会把它置上并一直留着,
-		 * 于是下一次播放一进来就把自己暂停 —— 表现是「每次开程序后第一个视频
-		 * 不自动播,第二个才正常」,而且看上去完全不像 HOME 键的问题。
-		 *
-		 * 挂起发生在播放开始**之前**,对这次播放毫无意义:那时根本没在播。
-		 * 这和代码里另一处的教训是同一条 —— 陈旧的异步请求不能活到
-		 * 它不再有意义的上下文里。 */
-		s_suspend_req = 0;
+		/* The session entry clears stale suspend requests. Preserve any new
+		 * HOME event raised while this stream was connecting. */
 		double last_clock_dbg = -1.0;
 		u64 last_report = 0;         /* 观看历史上报节流 */
 		/* 上报线程:主线程只置标志,网络请求不许出现在渲染循环里 */
@@ -2913,6 +3190,7 @@ static int player_play_inner(const char *url, const char *title) {
 		u64 wd_t0 = osGetTime();
 		bool wd_fired = false;
 		while (aptMainLoop()) {
+			dm_update();
 			if (!wd_fired && p->dbg_decoded == 0 &&
 			    osGetTime() - wd_t0 > 6000) {
 				wd_fired = true;
@@ -2938,19 +3216,37 @@ static int player_play_inner(const char *url, const char *title) {
 			bool holding = (kHeld & KEY_TOUCH) != 0;      /* 持续按住 */
 			if (holding) hidTouchRead(&tp);
 
+			bool controls_active = !in_pages && !in_comments && !in_psettings &&
+			                       !ui_console_active();
 			if (kDown & KEY_B) {
-				if (in_pages) { in_pages = false; }
+				if (in_pages) { in_pages = false; p->pause = pages_paused || ended; }
 				else if (in_comments) { in_comments = false; }
 				else if (in_psettings) { in_psettings = false; }
-				else { p->quit = 1; ret = 0; break; }
+				else { p->user_back = true; p->quit = 1; ret = 0; break; }
 			}
-			bool do_pause = (kDown & KEY_A) != 0;
+			bool want_actions = controls_active && s_actions_cb && (kDown & KEY_X);
+			bool want_up = false;
+			int seek_down = (kDown & (KEY_DLEFT | KEY_L)) ? -1 :
+				(kDown & (KEY_DRIGHT | KEY_R)) ? 1 : 0;
+			int seek_held = (kHeld & (KEY_DLEFT | KEY_L)) ? -1 :
+				(kHeld & (KEY_DRIGHT | KEY_R)) ? 1 : 0;
+			PlaybackInputAction keys = playback_input(&input, osGetTime(), controls_active,
+				kDown & KEY_A, kHeld & KEY_A, kUp & KEY_A,
+				ended ? 0 : seek_down, ended ? 0 : seek_held,
+				want_actions || (kDown & KEY_B) || s_suspend_req);
+			bool do_pause = keys.pause;
+			p->speed = keys.temporary_double && !ended ? 200 : saved_speed;
 			if (s_suspend_req) {          /* HOME 挂起:只暂停,不切换 */
 				s_suspend_req = 0;
-				if (!p->pause) do_pause = true;
+				p->pause = 1;
+				pages_paused = true;
+				do_pause = false;
 			}
 			bool want_dm_input = false;
-			if (kDown & KEY_X) p->sync_mode = !p->sync_mode;
+			int seek_step = keys.seek;
+			bool want_screenshot = controls_active && (kDown & KEY_Y);
+			if (screenshot_take_result() > 0) screenshot_chime(p);
+			const char *shot_status = screenshot_status();
 
 			/* 帧到点:上传纹理 */
 			if (p->mb_full && p->mb_gen != p->seek_gen) {
@@ -2963,7 +3259,9 @@ static int player_play_inner(const char *url, const char *title) {
 				u32 c = p->clock_ms, fpts = p->mb_pts_ms;
 				/* 正常:到点才上屏。异常:时间戳远在未来(>3s)说明它不可信,
 				 * 直接上屏,绝不为了一个坏时间戳把画面停住 */
-				if ((s32)(fpts - c) <= 5 || (s32)(fpts - c) > 3000) {
+				if (p->pause || (s32)(fpts - c) <= 5 || (s32)(fpts - c) > 3000 ||
+				    ((p->dbg_eof || p->read_error) && p->audio_ok && !p->buffering &&
+				     p->pending_n == 0 && audio_free_bufs(p) == AUDIO_NBUFS)) {
 					/* 追帧:这帧已经迟到很多(网络抖动/解码跟不上),
 					 * 上屏也只是补一张过期画面,反而把邮箱占着让 worker
 					 * 停工——丢掉它,腾出邮箱去解下一帧。
@@ -2976,7 +3274,7 @@ static int player_play_inner(const char *url, const char *title) {
 					 * 连续三轮丢完都没见好转,就永久关掉追帧,老老实实按序放。 */
 					s32 late = (s32)(c - fpts);
 					/* 均匀半速:认输之后走这条,和上面的成串追帧互斥 */
-					if (paced_half && late > 200 && have_pic) {
+					if (!p->dbg_eof && paced_half && late > 200 && have_pic) {
 						paced_skip = !paced_skip;
 						paced_good = 0;
 					} else {
@@ -2996,7 +3294,7 @@ static int player_play_inner(const char *url, const char *title) {
 					}
 					if (paced_skip) {
 						/* 这一帧按节奏丢掉,不上屏也不计入追帧统计 */
-					} else if (late > 400 && have_pic && catchup_ok && late_drop < 2) {
+					} else if (!p->dbg_eof && late > 400 && have_pic && catchup_ok && late_drop < 2) {
 						if (late_drop == 0) late_at_start = late;
 						late_drop++;
 					} else {
@@ -3090,7 +3388,7 @@ static int player_play_inner(const char *url, const char *title) {
 				    clock > dm_clock + 1.0) {
 					dm_clock = clock;            /* 首帧 / seek / 大偏差:硬对齐 */
 				} else {
-					dm_clock += dt;
+					dm_clock += dt * playback_speed(p->speed) / 100.0;
 					dm_clock += (clock - dm_clock) * 0.08;  /* 每帧收 8% */
 				}
 			}
@@ -3181,13 +3479,11 @@ static int player_play_inner(const char *url, const char *title) {
 				const float LY = 24.0f;
 				const float BAR_X = 306.0f, BAR_W = 8.0f;
 				float th = ui_text_height(UI_SHARP);
-				/* 可视区高度由底部那两行倒推,不写死 ——
-				 * 写死 170 的那一版,说明行正好落进了列表区里。
-				 * 底部布局:状态条 (th+8) 高、离屏底 2;说明行在它上面 5px。 */
+				/* Current-P bar above the same bottom gray hint as other child pages. */
 				float bar_h = th + 8.0f;
-				float bar_y = 240.0f - bar_h - 2.0f;
-				float hint_y = bar_y - th - 5.0f;
-				float LH = hint_y - 4.0f - LY;
+				float hint_y = 240.0f - th - 6.0f;
+				float bar_y = hint_y - bar_h - 5.0f;
+				float LH = bar_y - 4.0f - LY;
 				float maxscroll = s_pg_n * ROWH - LH;
 				if (maxscroll < 0) maxscroll = 0;
 
@@ -3252,10 +3548,16 @@ static int player_play_inner(const char *url, const char *title) {
 					if (tap && i != s_pg_cur) {
 						/* 换 P:退出播放,由 main.c 拿着下标重新取流 */
 						s_page_pick = i;
+						s_session_result = playback_page_result(i, pages_paused);
+						s_result_explicit = true;
+						ret = 0;
 						p->quit = 1;
 					}
 					/* 点当前这一 P:不是要换,是「就看这个」—— 关掉面板 */
-					if (tap && i == s_pg_cur) in_pages = false;
+					if (tap && i == s_pg_cur) {
+						in_pages = false;
+						p->pause = pages_paused || ended;
+					}
 					/* 【当前 P 不高亮】哪一 P 在放,底部状态条已经写着了;
 					 * 列表里再标一次只是让人以为「这一行被选中了」——
 					 * 而这一页里唯一的选中动作就是点按本身。 */
@@ -3323,13 +3625,20 @@ static int player_play_inner(const char *url, const char *title) {
 				if (comment_draw(touched, (kHeld & KEY_TOUCH) != 0,
 				                 tp.px, tp.py))
 					in_comments = false;
+				/* Match the gray control footer used by player child pages. */
+				float th = ui_text_height(UI_SHARP);
+				ui_rect_z(0, 240 - th - 10, 0.85f, 320, th + 10, UI_COL_BG);
+				ui_text_clipped_z(8, 240 - th - 5, 0.9f, UI_SHARP,
+					UI_COL_DIM, "滑动查看评论   B 返回播放", 304);
 			} else if (in_psettings && !ui_console_active()) { /* 播放设置子页 */
 				/* 和主设置页共用同一套列表控件:加一项只是往数组里加一行,
 				 * 不用重排布局。原来是四行两列的按钮网格,已经塞满 8 个。 */
 				enum { PS_3D, PS_SUB, PS_DMSZ, PS_SUBSZ, PS_ASPECT,
-				       PS_AREA, PS_SYNC, PS_DEBUG, PS_BACK, PS_N };
+				       PS_AREA, PS_SPEED, PS_QUALITY, PS_END, PS_SYNC, PS_DEBUG, PS_BACK, PS_N };
 				static const char *sz3[3]  = { "小", "中", "大" };
 				static const char *area4[4] = { "全屏", "1/2", "1/4", "1/8" };
+				static const char *end3[3] = { "暂停", "继续下一 P", "循环当前 P" };
+				PlayerEndMode end_mode = playback_end_mode(settings_get("end_mode", 0));
 				char sub_state[64];
 				if (!s_pref_sub)                snprintf(sub_state, sizeof sub_state, "关");
 				else if (sub_count() > 0)       snprintf(sub_state, sizeof sub_state,
@@ -3337,6 +3646,21 @@ static int player_play_inner(const char *url, const char *title) {
 				else if (!bili_logged_in())     snprintf(sub_state, sizeof sub_state, "开 · 需登录");
 				else                            snprintf(sub_state, sizeof sub_state, "开 · 本片无轨");
 				UiRow rows[PS_N];
+				char speed_value[32];
+				snprintf(speed_value, sizeof(speed_value), "%g 倍", saved_speed / 100.0);
+				rows[PS_SPEED] = (UiRow){ "播放倍速", speed_value,
+					"依次切换 1 / 1.25 / 1.5 / 2 倍。\n选择会保存。\n"
+					"长按 A 临时 2 倍,松开恢复。\n保持原音调。" };
+				/* Display measured dimensions as well as the quality class.
+				 * A server may return 360P even when 480P was requested. Base
+				 * the next choice on the actual stream so 480P can be retried. */
+				int short_edge = p->vw < p->vh ? p->vw : p->vh;
+				int actual_qn = short_edge > 360 ? 32 : 16;
+				char quality_value[48];
+				snprintf(quality_value, sizeof(quality_value), "%s (%dx%d)",
+				         actual_qn == 32 ? "480P" : "360P", p->vw, p->vh);
+				rows[PS_QUALITY] = (UiRow){ "分辨率", quality_value,
+					"切换 360P / 480P,选择会保存。\n重新取流后回到当前进度,\n保持播放或暂停状态。\n片源不支持时回退 360P。" };
 				rows[PS_3D]     = (UiRow){ "裸眼 3D", s_pref_3d ? "开" : "关",
 					"把左右分屏(SBS)片源变成\n立体画面,弹幕浮在前方,\n"
 					"深度随机身 3D 滑块。\n\n普通 2D 片开了只会花屏 ——\n它需要专门的片源。" };
@@ -3357,6 +3681,8 @@ static int player_play_inner(const char *url, const char *title) {
 					"解码跟不上时,在「画面连贯」\n和「音画对齐」之间取舍。\n\n"
 					"流畅优先:落后 400ms 才跳帧。\n同步优先:落后 150ms 就跳,\n"
 					"嘴型更准但跳得频繁。\n\n硬件解码时两者无差别。" };
+				rows[PS_END] = (UiRow){ "播放结束后", end3[end_mode],
+					"暂停:保留最后画面,A 重播。\n继续:有下一 P 才连播。\n循环:重播当前 P。\n此设置会保存。" };
 				rows[PS_DEBUG]  = (UiRow){ "调试台", NULL,
 					"全屏日志页。出问题时\n拍下来最有用。\n拖动滚动,双击退出。" };
 				rows[PS_BACK]   = (UiRow){ "返回", NULL, "回到播放控制。\nB 键同样可以。" };
@@ -3406,6 +3732,19 @@ static int player_play_inner(const char *url, const char *title) {
 					dm_set_area(s_dm_area);
 					break;
 				case PS_SYNC:  p->sync_mode = !p->sync_mode; break;
+				case PS_SPEED:
+					saved_speed = playback_next_speed(saved_speed);
+					p->speed = saved_speed;
+					settings_set("play_speed", saved_speed);
+					break;
+				case PS_QUALITY:
+					settings_set("qn", actual_qn == 32 ? 16 : 32);
+					s_session_result = playback_quality_result(p->clock_ms / 1000.0, p->pause != 0);
+					s_result_explicit = true;
+					p->quit = 1;
+					ret = 0;
+					break;
+				case PS_END: settings_set("end_mode", (end_mode + 1) % 3); break;
 				case PS_DEBUG: want_console = true; break;
 				case PS_BACK:  in_psettings = false; break;
 				default: break;
@@ -3455,8 +3794,8 @@ static int player_play_inner(const char *url, const char *title) {
 				/* seek 已提交但 worker 还没更新时钟的几帧里,继续显示目标
 				 * 位置,否则进度条会先闪回旧位置再跳到新位置 */
 				double shown_pos = dragging ? drag_pos
-				                 : (p->seek_req ? p->seek_to
-				                 : (seek_latch >= 0.0 ? seek_latch : clock));
+				                 : (seek_latch >= 0.0 ? seek_latch
+				                 : (p->seek_req ? p->seek_to : clock));
 				int cs = (int)shown_pos, ts = (int)p->duration;
 				snprintf(tbuf, sizeof(tbuf), "%02d:%02d / %02d:%02d",
 				         cs / 60, cs % 60, ts / 60, ts % 60);
@@ -3470,14 +3809,14 @@ static int player_play_inner(const char *url, const char *title) {
 
 				/* ---- 可拖动进度条 ---- */
 				#define BAR_X 14.0f
-				#define BAR_Y 178.0f
+				#define BAR_Y 188.0f
 				#define BAR_W 292.0f
-				#define BAR_H 10.0f
-				if (p->duration > 0.5) {
-					/* 命中区放宽到上下各 14px,方便手指/触笔 */
+				#define BAR_H 6.0f
+				if (p->duration > 0.5 && !ended) {
+					/* Keep the seek hitbox above the two-line gray control footer. */
 					bool in_bar = holding && tp.px >= BAR_X - 10 &&
 					              tp.px <= BAR_X + BAR_W + 10 &&
-					              tp.py >= BAR_Y - 14 && tp.py <= BAR_Y + BAR_H + 14;
+					              tp.py >= BAR_Y - 6 && tp.py <= BAR_Y + BAR_H + 6;
 					if (in_bar && !dragging && touched) dragging = true;
 					if (dragging && holding) {
 						float rel = (tp.px - BAR_X) / BAR_W;
@@ -3486,6 +3825,7 @@ static int player_play_inner(const char *url, const char *title) {
 						drag_pos = rel * p->duration;
 					}
 					if (dragging && (kUp & KEY_TOUCH)) { /* 松手 → 提交跳转 */
+						queued_seek = -1.0; /* Touch target supersedes held-key backlog. */
 						dragging = false;
 						if (!p->seek_req) {  /* 上次跳转还没处理完就忽略 */
 							p->seek_to = drag_pos;
@@ -3497,8 +3837,8 @@ static int player_play_inner(const char *url, const char *title) {
 						}
 					}
 					double shown = dragging ? drag_pos
-					             : (p->seek_req ? p->seek_to
-					             : (seek_latch >= 0.0 ? seek_latch : clock));
+					             : (seek_latch >= 0.0 ? seek_latch
+					             : (p->seek_req ? p->seek_to : clock));
 					float fill = (float)(shown / p->duration);
 					if (fill < 0) fill = 0;
 					if (fill > 1) fill = 1;
@@ -3526,8 +3866,10 @@ static int player_play_inner(const char *url, const char *title) {
 				 * 是没有别的入口的 —— 把唯一没有替代品的功能放在按钮上。
 				 * 单 P 视频照旧显示「返回」:这时选集按钮点了也没意义。 */
 				if (s_pg_n > 1) {
-					if (ui_button(10, 50, 96, 40, "选集", UI_COL_SEL,
+					if (ui_button(10, 48, 96, 36, "选集", UI_COL_SEL,
 					              btn_touch, tp.px, tp.py)) {
+						pages_paused = p->pause != 0;
+						p->pause = 1;
 						in_pages = true;
 						/* 选集页有自己的滚动状态,但设置页的列表控件是全局的
 						 * —— 先归零,免得两边互相污染 */
@@ -3537,17 +3879,15 @@ static int player_play_inner(const char *url, const char *title) {
 						if (pg_scroll < 0) pg_scroll = 0;
 						pg_drag = pg_bardrag = false;
 						pg_moved = 0.0f;
-						/* 【不暂停】和评论区一致:上屏照常播,下屏翻列表。
-						 * 双屏机器上「上面放着、下面操作」本来就是最自然的
-						 * 用法,为翻个列表把视频停掉反而多此一举。 */
+						/* Closing or choosing restores the captured user intent. */
 					}
-				} else if (ui_button(10, 50, 96, 40, "返回", UI_COL_SEL,
+				} else if (ui_button(10, 48, 96, 36, "返回", UI_COL_SEL,
 				                     btn_touch, tp.px, tp.py)) {
-					p->quit = 1; ret = 0;
+					p->user_back = true; p->quit = 1; ret = 0;
 				}
-				if (ui_button(112, 50, 96, 40, p->pause ? "播放" : "暂停",
+				if (ui_button(112, 48, 96, 36, ended ? "重播" : p->pause ? "播放" : "暂停",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) do_pause = true;
-				if (ui_button(214, 50, 96, 40, "设置", UI_COL_SEL,
+				if (ui_button(214, 48, 96, 36, "设置", UI_COL_SEL,
 				              btn_touch, tp.px, tp.py)) {
 					in_psettings = true;
 					ui_list_reset();   /* 滚动和高亮归零,别带着上次的状态进来 */
@@ -3555,11 +3895,11 @@ static int player_play_inner(const char *url, const char *title) {
 				/* 这一行只放得下一条。没声音优先:3D 那条是"可以更好",
 				 * 静音是"东西没按预期工作",后者更需要解释 */
 				if (!p->audio_ok && p->audio_err[0])
-					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT, p->audio_err);
+					ui_text(10, 132, UI_SHARP, UI_COL_ACCENT, p->audio_err);
 				else if (s_pref_3d != 0 && s_cur_qn < 32)
-					ui_text(10, 146, UI_SHARP, UI_COL_ACCENT,
+					ui_text(10, 132, UI_SHARP, UI_COL_ACCENT,
 					        "3D 建议切 480P 更清晰");
-				if (ui_button(10, 100, 96, 40,
+				if (ui_button(10, 90, 96, 36,
 				              s_pref_danmaku ? "弹幕:开" : "弹幕:关",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					s_pref_danmaku = !s_pref_danmaku;
@@ -3569,13 +3909,14 @@ static int player_play_inner(const char *url, const char *title) {
 					 * 同一个设置有两个入口时,两个都得落盘,
 					 * 否则「哪次算数」取决于用户从哪儿点的。 */
 					settings_set("danmaku", s_pref_danmaku);
+					if (s_pref_danmaku) dm_ensure_async(s_meta_cid);
 				}
-				if (ui_button(112, 100, 96, 40, "发弹幕",
+				if (ui_button(112, 90, 96, 36, "发弹幕",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py))
 					want_dm_input = true;
 				/* 右下角:评论区。视频不暂停 —— 双屏机器上「上屏看片、
 				 * 下屏看评论」本来就是最自然的用法 */
-				if (ui_button(214, 100, 96, 40, "评论",
+				if (ui_button(214, 90, 96, 36, "评论",
 				              UI_COL_SEL, btn_touch, tp.px, tp.py)) {
 					in_comments = true;
 					if (s_meta_aid && comment_count() == 0 && !comment_loading())
@@ -3583,9 +3924,92 @@ static int player_play_inner(const char *url, const char *title) {
 				}
 				/* 3D 的说明挪到「设置」子页去了:主覆盖层这行是常用键位,
 				 * 塞进只在开 3D 时才有意义的话会挤掉真正常用的信息。 */
-				ui_text(10, 204, UI_SHARP, UI_COL_DIM, "A 暂停  B 返回");
+                bool neighbors=s_pg_n>1||s_navigation.previous||s_navigation.next;
+                if (s_up_cb && ui_button(10,150,neighbors?90:110,28,"查看UP主",UI_COL_SEL,
+                              btn_touch,tp.px,tp.py))want_up=true;
+                if(neighbors) {
+                    int direction=player_neighbor_buttons(btn_touch,tp.px,tp.py);
+                    if(direction) {
+                        s_session_result=playback_neighbor_result(direction,!ended&&p->pause!=0);
+                        s_session_result.resume_seconds=s_player_clock_ms/1000.0;
+                        s_result_explicit=true;p->quit=1;ret=0;
+                        input=(PlaybackInput){0};do_pause=false;seek_step=0;
+                        want_actions=want_up=want_dm_input=false;
+                    }
+                }
+                char rate_label[64];
+                snprintf(rate_label,sizeof(rate_label),neighbors?"%g倍%s":"%g 倍%s",p->speed/100.0,
+                         keys.temporary_double?(neighbors?"(A)":" (长按 A)"):"");
+                if(!neighbors)ui_text_clipped(134,156,UI_SHARP,UI_COL_DIM,rate_label,176);
+                else if(p->audio_ok)ui_text_clipped(234,26,UI_SHARP,UI_COL_DIM,rate_label,82);
+				float th = ui_text_height(UI_SHARP);
+				float line2 = 238.0f - th, line1 = line2 - th - 1.0f;
+				ui_text_clipped(8, line1, UI_SHARP, UI_COL_DIM,
+					ended ? "播放结束  A 重播  B 返回" : "短按A 暂停  长按A 临时2倍  B 返回", 304);
+				ui_text_clipped(8, line2, UI_SHARP, UI_COL_DIM,
+					"L/R 跳转5秒(长按连跳) X互动 Y截图", 304);
 			}
+			/* Separate result toast; never replace or concatenate control hints.
+			 * Child screens keep their bottom hint; transient toast sits above it. */
+			if (shot_status && shot_status[0] && !ui_console_active()) {
+				float th = ui_text_height(UI_SHARP);
+				float y = (in_pages || in_comments || in_psettings) ? 174.0f : 129.0f;
+				ui_rect_z(4, y - 2, 0.92f, 312, th + 4, UI_COL_SEL);
+				ui_text_clipped_z(8, y, 0.95f, UI_SHARP, UI_COL_ACCENT,
+					shot_status, 304);
+			}
+			/* Touch entry and child pages cancel pending A/LR, including A+X. */
+			if (in_pages || in_comments || in_psettings || want_actions || want_up || want_dm_input) {
+				input = (PlaybackInput){0};
+				p->speed = saved_speed;
+				do_pause = false;
+				seek_step = 0;
+			}
+			if (want_screenshot) screenshot_prepare();
 			ui_end();
+			screenshot_finish();
+			if (seek_step && !ended) {
+				double base = queued_seek >= 0.0 ? queued_seek :
+					seek_latch >= 0.0 ? seek_latch : (double)p->clock_ms / 1000.0;
+				double target = playback_seek_target(base, p->duration, seek_step);
+				queued_seek = target;
+				p->cur_pts = target;
+				seek_latch = target;
+				seek_latch_t0 = osGetTime();
+			}
+			if (queued_seek >= 0.0 && !p->seek_req && !ended) {
+				p->seek_to = queued_seek;
+				__dmb();
+				p->seek_req = 1;
+				queued_seek = -1.0;
+			}
+			PlayerModalCallback modal = player_modal_callback(
+				playback_modal_route(controls_active, want_actions, want_up));
+			if (modal && !p->quit) {
+				bool prior_paused = p->pause != 0;
+				p->pause = 1;
+				__dmb();
+				if (p->audio_ok) ndspChnSetPaused(0, true);
+				for (int i = 0; i < 100 && !p->pause_applied && !p->worker_done; i++)
+					svcSleepThread(5 * 1000 * 1000LL);
+				if (p->audio_ok) ndspChnSetPaused(0, true);
+				s_in_actions = true;
+				modal();
+				s_in_actions = false;
+				if (s_navigation_requested) {
+					s_session_result = (PlayerResult){ .reason = PLAYER_BACK, .page_index = -1, .paused = prior_paused };
+					s_result_explicit = true;
+					p->user_back = true; p->quit = 1; ret = 0;
+					break; /* normal thread/decoder cleanup before main navigates */
+				}
+				p->pause = prior_paused || ended || s_suspend_req || aptShouldClose();
+				if (p->audio_ok) ndspChnSetPaused(0, p->pause || p->buffering);
+				ui_set_3d(s_pref_3d != 0);
+				ui_list_reset();
+				dm_clock = -1.0;
+				dm_t_last = osGetTime();
+				do_pause = false;
+			}
 
 			/* 字幕:等播放真正跑起来(缓冲结束)再拉,且与弹幕错开 1 秒。
 			 * 与取流/弹幕并发时,3DS httpc 会把响应发错对象 */
@@ -3681,6 +4105,12 @@ static int player_play_inner(const char *url, const char *title) {
 				/* 保持暂停,由用户决定何时继续 */
 			}
 			if (do_pause) {
+				if (ended) {
+					s_session_result = (PlayerResult){ .reason = PLAYER_REPLAY, .page_index = -1 };
+					s_result_explicit = true;
+					ret = 0;
+					break;
+				}
 				p->pause = !p->pause;
 				/* 记一行:暂停状态莫名其妙时,光看现象分不出是用户按的、
 				 * 触屏按钮点的,还是 HOME 挂起请求引起的 */
@@ -3689,7 +4119,25 @@ static int player_play_inner(const char *url, const char *title) {
 				         p->pause ? "暂停" : "继续",
 				         (unsigned long)p->clock_ms);
 			}
-			if (p->worker_done) { ret = p->ret; break; }
+			if (p->worker_done && !ended) {
+				ret = p->ret;
+				if (ret < 0 || !p->dbg_eof) break;
+				ended = true;
+				p->pause = 1;
+				p->buffering = 0;
+				if (p->audio_ok) ndspChnSetPaused(0, true);
+			}
+			if (ended && !s_result_explicit && !in_pages && !in_psettings && !in_comments) {
+				PlaybackEndAction action = playback_at_end(
+					playback_end_mode(settings_get("end_mode", 0)), s_start_options.has_next);
+				if (action != PLAYBACK_HOLD) {
+					s_session_result = (PlayerResult){ .reason = action == PLAYBACK_REPLAY
+						? PLAYER_REPLAY : PLAYER_FINISHED, .page_index = -1 };
+					s_result_explicit = true;
+					ret = 0;
+					break;
+				}
+			}
 		}
 
 		/* 退出顺序很重要:先置 quit 让所有等待循环解锁,
@@ -3720,6 +4168,26 @@ static int player_play_inner(const char *url, const char *title) {
 	}
 
 done:
+	screenshot_shutdown();
+	/* A screenshot writer may finish during the final join after the last
+	 * render iteration. Consume that result before DSP/player teardown so the
+	 * success chime is still queued on channel 1. The lower-screen toast has
+	 * already had its normal in-playback lifetime; the audio acknowledgement
+	 * remains useful when B/HOME exits immediately after capture. */
+	int final_shot_result = screenshot_take_result();
+	if (final_shot_result && !net_is_shutting_down() && !aptShouldClose()) {
+		if (final_shot_result > 0) screenshot_chime(p);
+		/* Keep DSP and a visible lower-screen result alive long enough for the
+		 * last asynchronous save acknowledgement before leaving the player. */
+		u64 notice_until = osGetTime() + 700;
+		while (osGetTime() < notice_until && aptMainLoop() && !aptShouldClose()) {
+			ui_begin();
+			ui_text(12, 100, UI_SHARP, UI_COL_TEXT, "正在返回视频列表");
+			ui_begin_bottom();
+			ui_text_clipped(10, 100, UI_SHARP, UI_COL_TEXT, screenshot_status(), 300);
+			ui_end();
+		}
+	}
 	if (dl_th) {
 		p->quit = 1;
 		p->ring.quit = 1;
@@ -3760,13 +4228,9 @@ done:
 		bili_report_history(s_meta_aid, s_meta_cid,
 		                    (int)(s_player_clock_ms / 1000));
 	ui_set_3d(false);   /* 离开播放页回到 2D(列表页不需要立体) */
-	/* 【判据:解复用读到了片尾,而且不是被别的意图打断】
-	 * p->quit 由「B 退出」和「点选集换 P」都会置位,所以光看它分不出来;
-	 * 加上 dbg_eof(av_read_frame 返回 <0)才是「真的看完了」。
-	 * 用户中途退出却被自动带到下一集,是最让人恼火的那种「聪明」。 */
-	s_ended_eof = (p->dbg_eof != 0) && (s_page_pick < 0) && (ret == 0);
-	ui_trace("playback end ret=%d eof=%d 自然结束=%d",
-	         ret, p->dbg_eof, (int)s_ended_eof);
+	/* Session return classifies explicit Back/Page/Replay separately from
+	 * AVERROR_EOF and read/decode errors. */
+	ui_trace("playback end ret=%d eof=%d", ret, p->dbg_eof);
 	printf("playback end (%d)\n", ret);
 	return ret;
 }

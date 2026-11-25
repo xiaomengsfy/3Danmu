@@ -38,6 +38,7 @@ echo "==> configure..."
 	--disable-zlib --disable-bzlib --disable-lzma --disable-iconv \
 	--disable-everything \
 	--enable-decoder=h264,aac,aac_latm,mp3,mjpeg \
+	--enable-encoder=mjpeg \
 	--enable-demuxer=mov,mp3,flv \
 	--enable-parser=h264,aac \
 	--enable-bsf=h264_mp4toannexb,extract_extradata \

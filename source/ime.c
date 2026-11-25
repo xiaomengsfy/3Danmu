@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "ime.h"
+#include "ime_policy.h"
 #include "ui.h"
 
 #define PY_MAX     24     /* 拼音缓冲上限 */
@@ -102,7 +103,10 @@ typedef struct {
 	u8  consume;      /* 选中后消耗的拼音字母数 */
 } Cand;
 
-static int collect(const char *py, int pylen, Cand *out) {
+static int collect(const char *pending, int pylen, Cand *out) {
+	char normalized[PY_MAX + 1];
+	ime_lookup_key(pending, (size_t)pylen, normalized, sizeof(normalized));
+	const char *py = normalized;
 	int n = 0;
 	if (!s_blob || pylen <= 0) return 0;
 	/* 1) 整串前缀匹配。
@@ -293,7 +297,11 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 			if (pylen > 0) { pylen = 0; py[0] = 0; ncand = 0; cbase = cdepth = cshown = 0; }
 			else { done = true; }                    /* 无拼音时 B = 取消 */
 		}
-		if (kDown & KEY_START) { confirmed = true; done = true; }
+		if (kDown & KEY_START) {
+			confirmed = done = ime_confirm(text, sizeof(text), py, &pylen);
+			ncand = pylen ? collect(py, pylen, cands) : 0;
+			cbase = cdepth = cshown = 0;
+		}
 		if ((kDown & KEY_L) && cdepth > 0) cbase = cstack[--cdepth];
 		if ((kDown & KEY_R) && cshown > 0 && cbase + cshown < ncand) {
 			if (cdepth < (int)(sizeof(cstack) / sizeof(cstack[0])))
@@ -313,8 +321,12 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 		 * 教训:把「当前标定值」抄成字面量,标定一变它就成了错的,
 		 * 而且**不会报错,只会变糊**。跟着 UI_SHARP 走,别再写死。 */
 		ui_text(10, 38, UI_SHARP, UI_COL_TEXT, text[0] ? text : "…");
-		if (pylen)
+		if (pylen) {
 			ui_text(10, 84, UI_SHARP, UI_COL_ACCENT, py);
+			ui_rect(10, 84 + ui_text_height(UI_SHARP), ui_text_width(py, UI_SHARP), 3, UI_COL_ACCENT);
+		}
+		ui_text_clipped(10, 142, UI_SHARP, UI_COL_DIM,
+		                "输入单字可能找不到候选字，可尝试组词输入。", 380);
 		ui_text(10, 202, UI_SHARP, UI_COL_DIM,
 		        IS_CN ? "空格=选第一候选   B 清拼音   L/R 翻候选页"
 		              : (sym ? "符号:点按直接上屏" : "英文:字母直接上屏"));
@@ -324,9 +336,22 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 		/* 文本行 */
 		ui_rect(0, 0, 320, 28, C2D_Color32(0x26, 0x26, 0x30, 0xFF));
 		{
-			char line[OUT_MAX + PY_MAX + 2];
-			snprintf(line, sizeof(line), "%s%s", text, py);
-			ui_text_clipped(6, 2, UI_SHARP, UI_COL_TEXT, line, 308);
+			float pw = ui_text_width(py, UI_SHARP);
+			if (pw > 308) pw = 308;
+			/* Keep pending Latin visible even after a long committed prefix.
+			 * Draw it separately so white text cannot hide its pink state. */
+			const char *visible = text;
+			if (pylen) while (*visible && ui_text_width(visible, UI_SHARP) > 308 - pw) {
+				visible++;
+				while ((*visible & 0xC0) == 0x80) visible++;
+			}
+			ui_text_clipped(6, 2, UI_SHARP, UI_COL_TEXT, visible, 308 - pw);
+			float px = 6 + ui_text_width(visible, UI_SHARP);
+			if (pylen && px < 314) {
+				if (pw > 314 - px) pw = 314 - px;
+				ui_text_clipped(px, 2, UI_SHARP, UI_COL_ACCENT, py, 314 - px);
+				ui_rect(px, 2 + ui_text_height(UI_SHARP), pw, 3, UI_COL_ACCENT);
+			}
 		}
 		/* 候选栏(仅中文模式) */
 		if (IS_CN && ncand > 0) {
@@ -465,16 +490,15 @@ bool ime_input(const char *hint, const char *initial, char *out, size_t outlen) 
 					utf8_pop(text);
 				}
 			}
-			if (ui_button(254, y, 64, FH, "完成", UI_COL_ACCENT, touched, tx, ty)) {
-				confirmed = true; done = true;
+			if (ui_button(254, y, 64, FH, "完成", UI_COL_ACCENT, touched && !(kDown & KEY_START), tx, ty)) {
+				confirmed = done = ime_confirm(text, sizeof(text), py, &pylen);
+				ncand = pylen ? collect(py, pylen, cands) : 0;
+				cbase = cdepth = cshown = 0;
 			}
 		}
 		ui_end();
 	}
 
-	/* 确认时拼音区还有残留字母:当英文直接拼上(比如想搜英文词) */
-	if (confirmed && pylen && strlen(text) + (size_t)pylen < sizeof(text))
-		strcat(text, py);
 	#undef IS_CN
 
 	if (confirmed && text[0]) {

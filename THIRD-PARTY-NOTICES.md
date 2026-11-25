@@ -9,7 +9,7 @@
 
 ## 1. FFmpeg —— LGPL 2.1 或更高
 
-**用途**:H.264 / AAC / MP3 / MJPEG 解码、解封装、重采样、缩放。
+**用途**:H.264 / AAC / MP3 / MJPEG 解码、MJPEG 截图编码、解封装、重采样、缩放。
 **版本**:6.1.2(见 `build-ffmpeg-3ds.sh`)
 **版权**:FFmpeg developers
 **主页**:https://ffmpeg.org/
@@ -20,6 +20,7 @@
 ```
 --disable-everything
 --enable-decoder=h264,aac,aac_latm,mp3,mjpeg
+--enable-encoder=mjpeg
 ```
 
 > ⚠️ **改构建脚本时注意**:一旦加上 `--enable-gpl`(例如为了 x264、

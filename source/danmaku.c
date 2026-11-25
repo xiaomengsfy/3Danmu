@@ -31,6 +31,16 @@ static volatile int s_count = 0;      /* 发布后才 >0(渲染线程只读) */
 static volatile int s_loading = 0;    /* 后台加载中 */
 static Thread s_thread = NULL;
 static int64_t s_pending_cid = 0;
+typedef struct {
+	int64_t cid;
+	unsigned generation;
+	DmItem *items;
+	int count;
+	volatile int done;
+} DmJob;
+static DmJob *s_job;
+static volatile unsigned s_generation;
+static int64_t s_current_cid;
 static float s_scale = 0.52f; /* 字号(dm_set_size)。0.52 = 清晰档,见 ui.c eff_scale */
 static float s_row_h = 16.0f;
 static int   s_rows  = 14;    /* 滚动行数 = 可用高度/行高,随字号与覆盖范围变 */
@@ -157,7 +167,7 @@ static int dm_cmp(const void *a, const void *b) {
 	return (d > 0) - (d < 0);
 }
 
-static int dm_parse(const char *xml) {
+static int dm_parse(const char *xml, DmItem **out) {
 	/* 先数总量,决定抽样间隔 */
 	limits_init();
 	int total = 0;
@@ -212,13 +222,7 @@ static int dm_parse(const char *xml) {
 	qsort(items, (size_t)n, sizeof(DmItem), dm_cmp);
 	for (int i = 0; i < n; i++)
 		items[i].row = 0xFF;          /* 0xFF = 尚未分配行,入场时再挑 */
-	/* 原子发布:先写数组指针,内存屏障后再公布条数 */
-	s_items = items;
-	s_cursor = 0;
-	s_last_clock = 0;
-	s_fresh = 1;
-	__dmb();
-	s_count = n;
+	*out = items;
 	return n;
 }
 
@@ -233,8 +237,7 @@ static void dm_clear_items(void) {
 	s_cursor = 0;
 }
 
-int dm_load(int64_t cid) {
-	dm_clear_items();
+static int dm_fetch(int64_t cid, DmItem **out) {
 	char url[128], cidstr[24];
 	{	/* i64 → str(newlib 无 %lld) */
 		char tmp[24]; int i = 0, o = 0;
@@ -255,12 +258,12 @@ int dm_load(int64_t cid) {
 
 	int n;
 	if (res.data[0] == '<') {          /* 未压缩 */
-		n = dm_parse(res.data);
+		n = dm_parse(res.data, out);
 	} else {                            /* deflate */
 		size_t xlen = 0;
 		uint8_t *xml = dm_inflate((const uint8_t *)res.data, res.len, &xlen);
 		if (!xml) { net_response_free(&res); return -1; }
-		n = dm_parse((const char *)xml);
+		n = dm_parse((const char *)xml, out);
 		free(xml);
 	}
 	net_response_free(&res);
@@ -269,63 +272,116 @@ int dm_load(int64_t cid) {
 }
 
 void dm_free(void) {
-	/* 【退出路径上的 join 超时要分场景】
-	 * 这三个后台线程(弹幕/字幕/评论)只在播放时存在 —— 这正是
-	 * 「只有播放中按 HOME→X 才卡」的一大块原因:原本每个最多等 8~10 秒,
-	 * 三个加起来能到半分钟,系统就一直停在 "Closing software"。
-	 * 系统要关我们时网络已被 net_shutdown_begin 封死、线程都在往外走,
-	 * 再按秒等没有意义,压到 0.5 秒。
-	 *
-	 * 【超时后不能 threadFree】线程还在跑,释放它的 Thread 结构就是
-	 * use-after-free。只能 threadDetach 丢下它,让进程收尾时一起带走。 */
-	if (s_thread) {
-		u64 ns = net_is_shutting_down() ? 500000000ULL : 10000000000ULL;
-		if (R_FAILED(threadJoin(s_thread, ns))) {
-			printf("danmaku thread join timeout\n");
-			threadDetach(s_thread);
-		} else {
-			threadFree(s_thread);
-		}
-		s_thread = NULL;
-	}
+	/* Invalidate before waiting. The worker owns only its job, never the
+	 * visible array. A slow old cid can finish later without publishing. */
+	s_generation++;
+	s_current_cid = s_pending_cid = 0;
 	s_loading = 0;
+	s_nlocal = 0;
 	dm_clear_items();
+	if (s_thread && R_SUCCEEDED(threadJoin(s_thread, 250000000ULL))) {
+		threadFree(s_thread);
+		s_thread = NULL;
+		free(s_job->items);
+		free(s_job);
+		s_job = NULL;
+	}
 }
 
 /* ---------- 异步加载 ---------- */
 
 static void dm_thread_main(void *arg) {
-	(void)arg;
+	DmJob *job = arg;
 	/* 立刻开始:开头的弹幕一条都不能漏。
 	 * 网络不稳时 0.3 秒连打 3 次会一秒内全烧完,整场就没弹幕了。
 	 * 改为退避重试(0.5s→1s→1.5s→2s→2.5s→3s),总窗口约 10 秒,
 	 * 落在播放器"等弹幕"的 20 秒上限之内 —— Wi-Fi 抖一下也能等到 */
 	for (int try_ = 0; try_ < 7; try_++) {
-		if (dm_load(s_pending_cid) >= 0) break;
+		if (job->generation != s_generation || net_is_shutting_down()) break;
+		job->count = dm_fetch(job->cid, &job->items);
+		if (job->count >= 0) break;
 		if (try_ == 6) { printf("danmaku gave up\n"); break; }
 		printf("danmaku load failed, retry %d\n", try_ + 1);
 		s64 ms = 500 * (try_ + 1);
 		if (ms > 3000) ms = 3000;
-		svcSleepThread(ms * 1000 * 1000LL);
+		for (s64 elapsed = 0; elapsed < ms; elapsed += 100) {
+			if (job->generation != s_generation || net_is_shutting_down()) break;
+			svcSleepThread(100 * 1000 * 1000LL);
+		}
 	}
 	__dmb();
-	s_loading = 0;
+	job->done = 1;
 }
 
-void dm_load_async(int64_t cid) {
-	s_nlocal = 0;      /* 换视频,清掉自己发的 */
-	dm_free();
-	s_pending_cid = cid;
-	s_loading = 1;
+static void dm_start_pending(void) {
+	if (s_thread || !s_pending_cid || net_is_shutting_down()) return;
+	limits_init(); /* Only the main thread queries model limits. */
+	s_job = calloc(1, sizeof(*s_job));
+	if (!s_job) { s_pending_cid = 0; s_loading = 0; return; }
+	s_job->cid = s_pending_cid;
+	s_job->generation = s_generation;
+	s_job->count = -1;
+	s_pending_cid = 0;
 	/* 挑空闲核心:core3(New3DS 备用)→ core1(系统核,已申请时间片)→ 任意。
 	 * 优先级调低,不与解码/呈现抢 CPU */
 	static const int cores[] = { 3, 2, -2 };   /* 核心 1 是系统核,别碰 */
 	for (int i = 0; i < 3 && !s_thread; i++)
-		s_thread = threadCreate(dm_thread_main, NULL, 32 * 1024, 0x38, cores[i], false);
-	if (!s_thread) {             /* 建不了线程就同步加载 */
-		dm_load(cid);
+		s_thread = threadCreate(dm_thread_main, s_job, 32 * 1024, 0x38, cores[i], false);
+	if (!s_thread) {
+		free(s_job);
+		s_job = NULL;
 		s_loading = 0;
 	}
+}
+
+void dm_update(void) {
+	if (s_job && s_job->done) {
+		__dmb();
+		/* done is published just before return, so only reap when join says
+		 * the thread has really stopped touching its stack/job. */
+		if (R_FAILED(threadJoin(s_thread, 0))) return;
+		threadFree(s_thread);
+		s_thread = NULL;
+		if (s_job->generation == s_generation && s_job->cid == s_current_cid) {
+			dm_clear_items();
+			s_items = s_job->items;
+			s_job->items = NULL;
+			s_count = s_job->count > 0 ? s_job->count : 0;
+			s_cursor = 0;
+			s_last_clock = 0;
+			s_fresh = 1;
+			s_loading = 0;
+		}
+		free(s_job->items);
+		free(s_job);
+		s_job = NULL;
+	}
+	dm_start_pending();
+}
+
+void dm_load_async(int64_t cid) {
+	dm_free();
+	if (cid <= 0) return;
+	s_current_cid = s_pending_cid = cid;
+	s_loading = 1;
+	dm_update();
+}
+
+void dm_ensure_async(int64_t cid) {
+	if (cid > 0 && cid != s_current_cid) dm_load_async(cid);
+	else dm_update();
+}
+
+int dm_load(int64_t cid) {
+	dm_free();
+	if (cid <= 0) return -1;
+	s_current_cid = cid;
+	DmItem *items = NULL;
+	int n = dm_fetch(cid, &items);
+	s_items = items;
+	s_count = n > 0 ? n : 0;
+	s_fresh = 1;
+	return n;
 }
 
 void dm_add_local(const char *text, double t) {

@@ -9,10 +9,14 @@
 int  dm_load(int64_t cid);
 
 /* 异步加载:在空闲核心的后台线程里下载+解压+解析,立即返回。
- * 加载期间 dm_count() 为 0、dm_draw() 不画,完成后自动生效。 */
+ * 加载期间 dm_count() 为 0、dm_draw() 不画;主线程每帧调用 dm_update 发布。 */
 void dm_load_async(int64_t cid);
+/* Main thread: start only if this cid has not already loaded/is loading. */
+void dm_ensure_async(int64_t cid);
+/* Main thread: publish completed data only for the current cid/generation. */
+void dm_update(void);
 
-/* 释放(会等待后台加载线程结束) */
+/* 释放可见数据并使在途任务失效;最多等待 250ms,余下由 dm_update 回收。 */
 void dm_free(void);
 
 /* 播放开始/跳转时重置游标 */

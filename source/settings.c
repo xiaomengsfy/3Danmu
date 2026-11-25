@@ -1,3 +1,4 @@
+#include "app_identity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,7 +6,9 @@
 
 #include "settings.h"
 
-#define SETTINGS_PATH "sdmc:/3ds/3danmu/settings.txt"
+#ifndef SETTINGS_PATH
+#define SETTINGS_PATH APP_DATA_DIR "/settings.txt"
+#endif
 #define MAX_ENTRIES 32
 #define KEY_MAX     24
 
@@ -50,7 +53,7 @@ int settings_get(const char *key, int def) {
 
 static void save(void) {
 	mkdir("sdmc:/3ds", 0777);
-	mkdir("sdmc:/3ds/3danmu", 0777);
+	mkdir(APP_DATA_DIR, 0777);
 	FILE *f = fopen(SETTINGS_PATH, "w");
 	if (!f) { printf("settings: save failed\n"); return; }
 	for (int i = 0; i < s_n; i++)

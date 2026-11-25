@@ -1,3 +1,4 @@
+#include "app_identity.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -160,12 +161,12 @@ static void trace_writer_main(void *arg) {
 	(void)arg;
 	while (!s_tq_quit || s_tq_head != s_tq_tail) {
 		while (s_tq_head != s_tq_tail) {
-			FILE *f = fopen("sdmc:/3ds/3danmu/trace.log", "a");
+			FILE *f = fopen(APP_TRACE_PATH, "a");
 			if (f) {
 				fseek(f, 0, SEEK_END);
 				if (ftell(f) > 64 * 1024) {   /* 别让它无限长 */
 					fclose(f);
-					f = fopen("sdmc:/3ds/3danmu/trace.log", "w");
+					f = fopen(APP_TRACE_PATH, "w");
 				}
 			}
 			if (!f) break;                    /* SD 不可用:本轮放弃,行留在队里 */
@@ -193,7 +194,7 @@ void ui_trace_sync(const char *fmt, ...) {
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	ui_printf("%s\n", buf);
-	FILE *f = fopen("sdmc:/3ds/3danmu/trace.log", "a");
+	FILE *f = fopen(APP_TRACE_PATH, "a");
 	if (!f) return;
 	fprintf(f, "[%llu] %s\n", (unsigned long long)osGetTime(), buf);
 	fclose(f);

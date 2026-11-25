@@ -12,6 +12,7 @@ typedef struct {
 	char    author[64];
 	int64_t cid;       /* 0 = 未知(搜索结果需再查 view 接口) */
 	char    pic[192];  /* 封面图 URL(可能为空) */
+	int64_t owner_mid; /* known UP identity, never infer from displayed name */
 	int64_t aid;       /* av 号(发弹幕要用,0 = 未知) */
 	int     duration;  /* 秒,0 = 未知 */
 	int64_t views;     /* -1 = 未知 */
@@ -20,6 +21,9 @@ typedef struct {
 	 * 3DS 上一次网络往返几百毫秒,而绝大多数视频只有一 P。
 	 * 列表接口给了这个数就别再问一遍。 */
 	int     pages;
+	/* History can reference licensed episodes without an ordinary BV entry. */
+	int64_t ep_id, season_id;
+	bool is_pgc;
 } BiliVideo;
 
 /* 一条评论。text 存原文,折行在绘制时按屏宽算(字体测量不是线程安全的,
@@ -45,6 +49,8 @@ int bili_comments(int64_t aid, int page, BiliComment *out, int max, int *count);
 int bili_init(void);
 
 bool bili_logged_in(void);
+/* Runtime identity only, 0 while logged out; never reads credential storage. */
+int64_t bili_account_id(void);
 /* 最近一次 API 错误描述(UI 显示用) */
 const char *bili_last_error(void);
 /* 已登录用户名(未登录返回 NULL) */
@@ -59,6 +65,53 @@ int bili_recommend(int page, BiliVideo *out, int max, int *count);
 /* 历史记录 / 默认收藏夹(均需登录) */
 int bili_history(int page, BiliVideo *out, int max, int *count);
 int bili_fav(int page, BiliVideo *out, int max, int *count);
+
+/* Personal API replies never infer success from an empty/malformed response.
+ * UNKNOWN after a write means the server may have applied it: do not retry. */
+typedef enum { BILI_API_SUCCESS, BILI_API_REJECTED, BILI_API_UNKNOWN } BiliApiOutcome;
+typedef struct {
+	BiliApiOutcome outcome;
+	int http_status;
+	int64_t code;
+	bool has_code;
+	bool login_required;
+} BiliApiResult;
+typedef struct { int64_t id; char title[128]; int media_count; bool contains, membership_known; } BiliFavFolder;
+typedef struct {
+	int count;                 /* usable entries copied into the output */
+	int64_t total;             /* server total, including non-video resources */
+	bool has_more;             /* server pagination, independent of count */
+	bool truncated;            /* caller capacity/server list omitted entries */
+} BiliPageInfo;
+typedef enum {
+	BILI_LIKE_UNKNOWN,
+	BILI_LIKE_CONFIRMED,
+	BILI_LIKE_NOT_REPORTED      /* 0 only means no RECENT like reported */
+} BiliLikeState;
+
+/* Caller owns output; all outputs cleared even on error. No personal cache.
+ * list-all returns every created folder up to max, with explicit truncation.
+ * Folder contents use ps=20; page starts at 1. */
+BiliApiResult bili_fav_folders(BiliFavFolder *out, int max, BiliPageInfo *info);
+BiliApiResult bili_fav_folder(int64_t folder_id, int page, BiliVideo *out,
+                             int max, BiliPageInfo *info);
+BiliApiResult bili_like_set(int64_t aid, bool like);
+BiliApiResult bili_like_status(int64_t aid, BiliLikeState *state);
+
+/* Profile counts unavailable from an endpoint remain -1. */
+typedef struct {
+    int64_t mid, fans, videos;
+    char name[64], sign[192], face[192];
+    int level;
+} BiliProfile;
+BiliApiResult bili_profile(BiliProfile *out);
+BiliApiResult bili_watchlater(int page, BiliVideo *out, int max, BiliPageInfo *info);
+BiliApiResult bili_watchlater_contains(int64_t aid, bool *found);
+BiliApiResult bili_watchlater_add(int64_t aid);
+BiliApiResult bili_watchlater_remove(int64_t aid);
+BiliApiResult bili_search_users(const char *keyword, int page, BiliProfile *out, int max, BiliPageInfo *info);
+BiliApiResult bili_user_profile(int64_t mid, BiliProfile *out);
+BiliApiResult bili_user_videos(int64_t mid, int page, BiliVideo *out, int max, BiliPageInfo *info);
 
 /* 视频搜索(需要 WBI 签名) */
 int bili_search(const char *keyword, int page, BiliVideo *out, int max, int *count);

@@ -2,6 +2,20 @@
 #define PLAYER_H
 
 #include <stdbool.h>
+#include <stdint.h>
+#include "playback_policy.h"
+
+/* One stream; main owns next-P/replay URL refresh. End mode is settings key
+ * end_mode: 0 pause (default), 1 continue, 2 loop current. */
+PlayerResult player_play_session(const char *url, const char *title,
+                                PlayerStartOptions options);
+/* Called outside a render frame; playback pauses and restores prior intent. */
+void player_set_actions_cb(void (*cb)(void));
+/* X opens full interactions; direct UP button uses the same modal lifetime. */
+void player_set_up_cb(void (*cb)(void));
+/* Actions callback only: defer navigation until normal playback cleanup.
+ * Session returns PLAYER_BACK; main then consumes its queued destination. */
+void player_request_navigation(void);
 
 /* 流式播放一个 http(s) mp4 直链(h264+aac)。
  * 阻塞直到播放完或用户按 B 退出。返回 0 正常结束,<0 出错。
@@ -15,6 +29,9 @@ int player_play(const char *url, const char *title);
  * 选集子页里上屏保持暂停,下屏换成列表。 */
 void player_set_pages(const char *const *labels, const int *durations,
                       int n, int cur);
+/* Set after pages; main owns cross-item queue boundaries, including random
+ * favorites. Manual neighbors remain available independently of end mode. */
+void player_set_navigation(PlayerNavigationKind kind,bool previous,bool next);
 /* 播放结束后问一次:用户在选集里挑了哪一 P(-1 = 没挑,正常退出)。
  * 取走即清。重新取流由 main.c 负责 —— 播放器不碰分P 的数据。 */
 int  player_take_page_pick(void);

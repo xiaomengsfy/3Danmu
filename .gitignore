@@ -26,3 +26,12 @@ Thumbs.db
 # romfs/font.bcfnt   8MB,没有它界面全是 ?,别人 clone 下来编不出可用的程序
 # romfs/pinyin.dic   1MB,没有它拼音输入法退化成英文键盘
 # 它们是构建输入而不是构建产物。体积在 GitHub 的舒适区内(单文件 < 50MB)。
+
+# Local caches and runtime account data
+__pycache__/
+*.pyc
+cookies.txt
+settings.ini
+trace.log
+.env
+.env.*

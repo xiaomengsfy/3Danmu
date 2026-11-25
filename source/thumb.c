@@ -1,3 +1,4 @@
+#include "app_identity.h"
 /* 封面缩略图加载(实现说明见 thumb.h)
  *
  * 线程分工:
@@ -24,7 +25,7 @@
 #include "settings.h"   /* 缓存文件数存在这里,免得每次开机重扫 */
 #include "ui.h"   /* printf 要经 ui_printf 才进得了调试台环形缓冲 */
 
-#define THUMB_CACHE_DIR "sdmc:/3ds/3danmu/thumbs"
+#define THUMB_CACHE_DIR APP_DATA_DIR "/thumbs"
 #define SLOTS    20
 #define TEX_W    128
 #define TEX_H    64
@@ -82,7 +83,7 @@ static volatile int s_clr_total;  /* 开工前数出来的总数,0 = 还没数�
 
 void thumb_init(void) {
 	mkdir("sdmc:/3ds", 0777);
-	mkdir("sdmc:/3ds/3danmu", 0777);
+	mkdir(APP_DATA_DIR, 0777);
 	mkdir(THUMB_CACHE_DIR, 0777);
 	cache_scan_kick();   /* 后台统计缓存占用,不阻塞任何人 */
 	for (int i = 0; i < SLOTS; i++) {
