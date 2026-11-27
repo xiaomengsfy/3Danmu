@@ -24,8 +24,8 @@
     "sha256": "f46c0e6a6c47fe5d647f57adbf3cb63f2e95fcb7abfdf91d7f7e6bac233272b9"
   },
   "README.md": {
-    "bytes": 2957,
-    "sha256": "7eff556e656caa87dfefeee68a640fd9c184da66ac16cf619f8cc1af1e2e83b1"
+    "bytes": 2864,
+    "sha256": "31f5ee8d746bdeda6aa7597a2da5f2f7786dfca2107bee4ac0ac88e4bd6d9107"
   },
   "TESTING.md": {
     "bytes": 11131,
@@ -60,16 +60,16 @@
     "sha256": "6a436ab3fe6d8e631d94c5736c8978292e0a71f0cc0f92fd94ca2a6b47742cd6"
   },
   "docs/BUILD-ZH.md": {
-    "bytes": 1366,
-    "sha256": "d000a1cddff8ed1b8fe6f85f6b2178db47d9ba4119d55be119441bfa2aa11e61"
+    "bytes": 1264,
+    "sha256": "7d7fc874f96b50bad0d6b673adc187ea34daabc66529b4e7747ddcb520161d25"
   },
   "docs/FEATURES-ZH.md": {
-    "bytes": 4392,
-    "sha256": "a7ec8f7b1b3d0d1009ea854d0e09e2b1e85281c75629b6b75e1b072e0a39bc30"
+    "bytes": 4245,
+    "sha256": "6b1132914ee761215d4a6e4db95501dbc16f1808fec300ea53d455e203ea78ae"
   },
   "docs/GITHUB-UPLOAD-ZH.md": {
-    "bytes": 1361,
-    "sha256": "2d4afdba95e5e0638da25f9f395d509f375d2dd0494329298c58623dfde373e9"
+    "bytes": 1320,
+    "sha256": "d55e7dc93781005fe984201adb628bcd8cc84479294c5df4bab1d8dd21e84a5f"
   },
   "docs/README-original-and-development.md": {
     "bytes": 27489,
@@ -80,12 +80,8 @@
     "sha256": "d689f38934670be12c20ffe9b2d864e209dbd820304753a3cb8eca99a46dd599"
   },
   "docs/VERIFICATION.md": {
-    "bytes": 3234,
-    "sha256": "23fdc56de185bd4e389e5f6c6a1a128a53a7888b34e895c2eead2a855ba2aa58"
-  },
-  "docs/host-tests.log": {
-    "bytes": 12236,
-    "sha256": "6ccbf066ea675d4a0474c372e1403e45a9fea456d0d77d290f24da8ec0cef843"
+    "bytes": 926,
+    "sha256": "d2c78836c256dbb1f282ea3653a72bbd04b84953818240a95c58af0e2fc4bd7d"
   },
   "licenses/LGPL-2.1.txt": {
     "bytes": 27019,
@@ -240,8 +236,8 @@
     "sha256": "5093d494418c63aa54fca341c11f3edd754848c14c43d51df76d9e420855876b"
   },
   "source/main.c": {
-    "bytes": 90660,
-    "sha256": "792c5f85d849b9c5b8c716bfe69ba87f67245730c64149b3846a2f8d1fce5db5"
+    "bytes": 90643,
+    "sha256": "b4e6f97f4c2347afbeb6a24637540947ce1be111d40d13b994089747ab138a9d"
   },
   "source/md5.c": {
     "bytes": 2801,

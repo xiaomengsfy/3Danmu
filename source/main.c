@@ -109,7 +109,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.3.10-kina-navigation"
+#define APP_VERSION "1.3.9"
 
 /* ---------- 分 P ----------
  * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。

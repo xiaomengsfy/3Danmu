@@ -11,10 +11,10 @@
 ```bash
 git init
 git add .
-git commit -m "Import 3Danmu Kina v1.3.8 source"
+git commit -m "Import 3Danmu Kina v1.3.9 source"
 git branch -M main
 git remote add origin https://github.com/YOUR-NAME/YOUR-REPO.git
 git push -u origin main
 ```
 
-本包不含 .git 历史、编译结果、开发环境、个人 cookie、进度或设备固件。新增 .gitignore 项保护常见本地运行数据。所有应用源码与资源和当前 v1.3.8 工作树逐文件核对；测试仅调整相对引用与临时数据落点，原开发工作树未改写。
+本包不含 .git 历史、编译结果、开发环境、个人 cookie、进度或设备固件。新增 .gitignore 项保护常见本地运行数据。发布前请运行主机测试并核对版本号；不要上传本地构建日志、工具链或账号数据。
