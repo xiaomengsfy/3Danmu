@@ -475,7 +475,14 @@ BiliApiResult api_response_history(int t,int s,const char *b,size_t n,
         if(!v.season_id&&(!optional_number(&d,bangumi,"season_id",&v.season_id)||v.season_id<0))goto invalid;
         if(!v.ep_id)v.ep_id=history_link_id(redirect,"ep");
         if(!v.season_id)v.season_id=history_link_id(redirect,"ss");
-        v.is_pgc=v.ep_id>0||v.season_id>0||!strcmp(business,"pgc");
+        /* UGC collections also carry season_id. It is not a PGC type tag.
+         * An explicit archive business wins; legacy records need an episode,
+         * a bangumi object, or a validated bangumi playback URL. */
+        int64_t bangumi_season=0;
+        if(!optional_number(&d,bangumi,"season_id",&bangumi_season)||bangumi_season<0)goto invalid;
+        v.is_pgc=!strcmp(business,"pgc") || (!business[0] &&
+            (v.ep_id>0 || bangumi_season>0 || history_link_id(redirect,"ss")>0));
+        if(!v.is_pgc){v.ep_id=0;v.season_id=0;}
         if(business[0]&&strcmp(business,"pgc")&&strcmp(business,"archive"))continue;
         if(!optional_text(&d,owner,"name",v.author,sizeof(v.author)))goto invalid;
         if(!v.author[0])optional_text(&d,at,"author_name",v.author,sizeof(v.author));

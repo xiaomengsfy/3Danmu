@@ -53,8 +53,12 @@ BrowseChoice browse_profile_relationship(const BiliProfile *p,bool own,const cha
     while(live()) {
         touchPosition t;u32 down=input(&t);if(down&KEY_B)return BROWSE_BACK;
         int count=own?5:2;
-        if((down&KEY_DOWN)&&focus+1<count)focus++;
-        if((down&KEY_UP)&&focus>0)focus--;
+        if((down&KEY_LEFT) && focus%2)focus--;
+        else if((down&KEY_RIGHT) && !(focus%2) && focus+1<count)focus++;
+        else if((down&KEY_UP) && focus>=2)focus-=2;
+        else if((down&KEY_DOWN) && focus/2<(count-1)/2) {
+            focus+=2;if(focus>=count)focus=count-1;
+        }
         ui_begin();profile_top(p,message);ui_begin_bottom();
         BrowseChoice choice=BROWSE_BACK;bool back=false;
         static const char *own_names[]={"我的投稿","播放历史","我的关注","我的粉丝","稍后再看"};
@@ -66,7 +70,7 @@ BrowseChoice browse_profile_relationship(const BiliProfile *p,bool own,const cha
                 own?own_names[i]:up_names[i],i==focus?UI_COL_ACCENT:UI_COL_SEL,down&KEY_TOUCH,t.px,t.py);
             if(hit||((down&KEY_A)&&i==focus))choice=own?own_choices[i]:up_choices[i];
         }
-        ui_text(12,218,UI_SHARP,UI_COL_DIM,"上下选择  A 打开  B 返回");
+        ui_text(12,218,UI_SHARP,UI_COL_DIM,"方向键选择  A 打开  B 返回");
         back=button(12,184,296,28,"返回",down,t);ui_end();
         if(back || choice!=BROWSE_BACK)return choice;
     }
@@ -201,4 +205,47 @@ bool browse_watchlater_add(const BiliVideo *video,BrowseRunner run,bool (*login)
         }
     }
     return submitted;
+}
+
+int browse_folders(const BiliFavFolder *folders,int count,bool truncated) {
+    if(!folders || count<0)return -1;
+    int focus=0;
+    while(live()) {
+        touchPosition touch;u32 down=input(&touch);
+        if(down&KEY_B)return -1;
+        if(count>0) {
+            if((down&KEY_UP) && focus>0)focus--;
+            else if((down&KEY_DOWN) && focus+1<count)focus++;
+            else if((down&(KEY_LEFT|KEY_L)) && focus>=4)focus-=4;
+            else if((down&(KEY_RIGHT|KEY_R)) && focus/4<(count-1)/4) {
+                focus+=4;if(focus>=count)focus=count-1;
+            }
+        }
+        ui_begin();
+        char line[128],id[24];
+        ui_text_clipped(12,16,UI_SHARP,UI_COL_ACCENT,"我的收藏夹",376);
+        if(count>0) {
+            const BiliFavFolder *f=&folders[focus];decimal(f->id,id);
+            ui_text_clipped(12,50,UI_SHARP,UI_COL_TEXT,f->title,376);
+            snprintf(line,sizeof line,"收藏夹 ID %s",id);
+            ui_text_clipped(12,88,UI_SHARP,UI_COL_DIM,line,376);
+            snprintf(line,sizeof line,"视频数量：%d",f->media_count);
+            ui_text_clipped(12,120,UI_SHARP,UI_COL_TEXT,line,376);
+            snprintf(line,sizeof line,"第 %d/%d 个  第 %d/%d 页",focus+1,count,focus/4+1,(count+3)/4);
+            ui_text_clipped(12,154,UI_SHARP,UI_COL_DIM,line,376);
+        } else ui_text_clipped(12,50,UI_SHARP,UI_COL_TEXT,"还没有收藏夹",376);
+        if(truncated)ui_text_clipped(12,188,UI_SHARP,UI_COL_DIM,"收藏夹超过128个，仅显示前128个",376);
+        ui_begin_bottom();int hit=-1,first=focus/4*4;
+        for(int i=first;i<count && i<first+4;i++) {
+            if(ui_button(10,12+(i-first)*40,300,34,folders[i].title,
+                i==focus?UI_COL_ACCENT:UI_COL_SEL,down&KEY_TOUCH,touch.px,touch.py))hit=i;
+        }
+        bool back=button(10,178,300,30,"返回",down,touch);
+        ui_text(8,218,UI_SHARP,UI_COL_DIM,"上下选择 左右/L/R翻页 A打开 B返回");
+        ui_end();
+        if(back)return -1;
+        if(hit>=0)return hit;
+        if((down&KEY_A)&&count>0)return focus;
+    }
+    return -1;
 }

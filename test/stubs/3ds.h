@@ -41,6 +41,12 @@ void ui_printf(const char *, ...);
 void ui_trace(const char *, ...);
 void ui_log_ascii(const char *,const char *,int);
 typedef struct { unsigned short px,py; } touchPosition;
+#ifndef KEY_LEFT
+#define KEY_LEFT (1u<<8)
+#endif
+#ifndef KEY_RIGHT
+#define KEY_RIGHT (1u<<9)
+#endif
 #define KEY_A (1u<<0)
 #define KEY_B (1u<<1)
 #define KEY_L (1u<<2)

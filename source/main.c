@@ -109,7 +109,7 @@ static int s_hl_mode = -1;        /* 高亮覆盖:点击后立刻亮新的(-1=�
 static char s_keyword[128] = {0};
 static char s_status[192] = "";
 /* 名字以数字开头,所以宏名不能叫 3DANMU_VERSION(C 标识符不许数字打头) */
-#define APP_VERSION "1.3.8-kina-favtouch"
+#define APP_VERSION "1.3.10-kina-navigation"
 
 /* ---------- 分 P ----------
  * 200 是务实的上限:课程/合集偶尔上百 P,再多就不该在掌机上翻了。
@@ -836,33 +836,13 @@ static bool choose_favorite_folder(void) {
         if (s_count && !net_is_shutting_down()) thumb_start(s_list,s_count);
         return false;
     }
-    ui_list_reset();
-    bool picked=false;
-    while (aptMainLoop() && !net_is_shutting_down()) {
-        hidScanInput();
-        u32 down=hidKeysDown(),held=hidKeysHeld(),up=hidKeysUp();
-        if (down & KEY_B) break;
-        touchPosition touch={0};
-        if (held & KEY_TOUCH) hidTouchRead(&touch);
-        UiRow rows[FOLDER_CAP];
-        for (int i=0;i<s_folder_info.count;i++)
-            rows[i]=(UiRow){s_folders[i].title,NULL,"打开此收藏夹的视频列表。"};
-        ui_begin();
-        ui_help_draw("我的收藏夹",
-            s_folder_info.count ? "选择收藏夹后查看视频。\n空收藏夹也会显示。\nB 返回。" : "还没有收藏夹。\nB 返回。",
-            s_folder_info.truncated ? "收藏夹超过128个，当前仅显示前128个" : NULL,NULL);
-        int hit=ui_list_draw("收藏夹",rows,s_folder_info.count,down&KEY_TOUCH,
-                            held&KEY_TOUCH,up&KEY_TOUCH,touch.px,touch.py);
-        ui_end();
-        if (hit>=0 && hit<s_folder_info.count) {
-            s_fav_id=s_folders[hit].id;
-            snprintf(s_fav_title,sizeof(s_fav_title),"%s",s_folders[hit].title);
-            ++s_request_generation;
-            picked=true;
-            break;
-        }
+    int hit=browse_folders(s_folders,s_folder_info.count,s_folder_info.truncated);
+    bool picked=hit>=0 && hit<s_folder_info.count;
+    if(picked) {
+        s_fav_id=s_folders[hit].id;
+        snprintf(s_fav_title,sizeof(s_fav_title),"%s",s_folders[hit].title);
+        ++s_request_generation;
     }
-    ui_list_reset();
     if (!picked && s_count && !net_is_shutting_down()) thumb_start(s_list,s_count);
     return picked;
 }

@@ -5,6 +5,8 @@
 #include "browse_ui.h"
 #include "ui.h"
 #undef printf
+int browse_folders(const BiliFavFolder *,int,bool);
+static bool saw_folder_title,saw_folder_count,saw_folder_id,saw_folder_focus;
 static int checks,failures,frame,read_count,write_count,run_count;
 static bool logged=true,contains=true,cancel_read,shutdown_flag,close_after_read;
 static int draws_after_close,search_count,remove_count;
@@ -28,6 +30,9 @@ void ui_list_reset(void){}
 void ui_text(float x,float y,float s,uint32_t c,const char *text){(void)x;(void)s;if(bottom&&y>=212&&c==UI_COL_DIM&&strstr(text,"A")&&strstr(text,"B")&&strstr(text,"L/R"))search_hints=true;}
 void ui_text_clipped(float x,float y,float s,uint32_t c,const char *text,float w){
     (void)x;(void)y;(void)s;(void)c;(void)w;
+    if(!bottom && !strcmp(text,"Folder5"))saw_folder_title=true;
+    if(!bottom && strstr(text,"105"))saw_folder_id=true;
+    if(!bottom && strstr(text,"50"))saw_folder_count=true;
     if(strstr(text,"单次"))saw_once=true;
     if(strstr(text,"已在稍后再看"))saw_confirmed=true;
     if(strstr(text,"未确认"))saw_unknown=true;
@@ -36,6 +41,7 @@ void ui_text_clipped(float x,float y,float s,uint32_t c,const char *text,float w
 bool ui_button(float x,float y,float w,float h,const char *label,uint32_t bg,bool t,float tx,float ty){
     (void)x;(void)y;(void)w;(void)bg;(void)t;(void)tx;(void)ty;
     CHECK(y+h<=UI_TOUCH_BOTTOM);
+    if(!strcmp(label,"Folder5") && bg==UI_COL_ACCENT)saw_folder_focus=true;
     if(!strcmp(label,"取消稍后再看")){saw_remove_button=true;CHECK(bg==UI_COL_ACCENT);}
     if(!strcmp(label,"向上")||!strcmp(label,"向下")||!strcmp(label,"上一页")||!strcmp(label,"下一页")||!strcmp(label,"消息")||strstr(label,"动态"))removed_button=true;
     return buttons[frame] && !strcmp(label,buttons[frame]);
@@ -66,6 +72,16 @@ static void reset(void){
     memset(buttons,0,sizeof(buttons));memset(keys,0,sizeof(keys));keys[9]=KEY_B;
 }
 int main(void){
+    BiliFavFolder folders[9]={0};
+    for(int i=0;i<9;i++){folders[i].id=101+i;folders[i].media_count=(i+1)*10;snprintf(folders[i].title,sizeof folders[i].title,"Folder%d",i+1);}
+    reset();keys[1]=KEY_RIGHT;keys[2]=KEY_A;
+    CHECK(browse_folders(folders,9,false)==4 && saw_folder_title && saw_folder_id && saw_folder_count && saw_folder_focus);
+    reset();keys[1]=KEY_L;keys[2]=KEY_UP;keys[3]=KEY_A;CHECK(browse_folders(folders,9,false)==0);
+    reset();keys[1]=KEY_R;keys[2]=KEY_R;keys[3]=KEY_R;keys[4]=KEY_DOWN;keys[5]=KEY_A;CHECK(browse_folders(folders,9,true)==8);
+    reset();keys[1]=KEY_R;keys[2]=KEY_LEFT;keys[3]=KEY_DOWN;keys[4]=KEY_A;CHECK(browse_folders(folders,9,false)==1);
+    reset();buttons[1]="Folder3";CHECK(browse_folders(folders,9,false)==2);
+    reset();keys[1]=KEY_B;CHECK(browse_folders(folders,9,false)==-1);
+    reset();keys[1]=KEY_A;keys[2]=KEY_B;CHECK(browse_folders(folders,0,false)==-1);
     BiliVideo v={.aid=99};strcpy(v.title,"Video");BiliProfile p;
     reset();buttons[1]="UP主";CHECK(browse_search_kind()==1);
     reset();buttons[1]="番剧";CHECK(browse_search_kind()==2);
@@ -84,6 +100,12 @@ int main(void){
     CHECK(!browse_users("name",run,&p) && !draws_after_close && !p.mid);
     reset();cancel_read=true;buttons[1]="UP";
     CHECK(!browse_users("name",run,&p) && !p.mid);
+    reset();keys[1]=KEY_RIGHT;keys[2]=KEY_A;CHECK(browse_profile(&p,true,"")==BROWSE_HISTORY);
+    reset();keys[1]=KEY_DOWN;keys[2]=KEY_A;CHECK(browse_profile(&p,true,"")==BROWSE_FOLLOWING);
+    reset();keys[1]=KEY_RIGHT;keys[2]=KEY_DOWN;keys[3]=KEY_A;CHECK(browse_profile(&p,true,"")==BROWSE_FANS);
+    reset();keys[1]=KEY_RIGHT;keys[2]=KEY_LEFT;keys[3]=KEY_A;CHECK(browse_profile(&p,true,"")==BROWSE_SUBMISSIONS);
+    reset();keys[1]=KEY_DOWN;keys[2]=KEY_RIGHT;keys[3]=KEY_DOWN;keys[4]=KEY_RIGHT;keys[5]=KEY_A;CHECK(browse_profile(&p,true,"")==BROWSE_WATCHLATER);
+    reset();keys[1]=KEY_RIGHT;keys[2]=KEY_A;CHECK(browse_profile(&p,false,"")==BROWSE_RELATION);
     reset();buttons[1]="我的投稿";CHECK(browse_profile(&p,true,"")==BROWSE_SUBMISSIONS);
     reset();buttons[1]="我的关注";CHECK(browse_profile(&p,true,"")==BROWSE_FOLLOWING);
     reset();buttons[1]="关注的动态";keys[2]=KEY_B;CHECK(browse_profile(&p,true,"")==BROWSE_BACK && !removed_button);

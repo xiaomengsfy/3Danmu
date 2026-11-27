@@ -13,7 +13,7 @@ make -j2
 make cia
 ```
 
-FFmpeg 脚本下载并编译 6.1.2（含 MJPEG 编码器），写入工具链 portlibs，末尾使用 sudo make install；运行前核对自己的安装路径及权限。zlib 必须另由工具链提供。输出为根目录 `3danmu.3dsx`、`3danmu.cia`。具体环境说明见 `../DEVELOPING.md`。本次仅整理源码，没有重新进行 ARM/CIA 构建；旧版本构建通过不代表任意新环境均可直接构建。
+FFmpeg 脚本下载并编译 6.1.2（含 MJPEG 编码器），写入工具链 portlibs，末尾使用 sudo make install；运行前核对自己的安装路径及权限。zlib 必须另由工具链提供。输出为根目录 `3danmu.3dsx`、`3danmu.cia`。具体环境说明见 `../DEVELOPING.md`。v1.3.10 已在既有私有环境完成 ARM/CIA 构建；本 GitHub 目录未单独执行交叉构建，该结果不代表任意新环境均可直接构建。
 
 ## 无设备主机回归
 
@@ -23,4 +23,4 @@ FFmpeg 脚本下载并编译 6.1.2（含 MJPEG 编码器），写入工具链 po
 CC=gcc bash tools/test-host.sh
 ```
 
-脚本基于 v1.3.8 原有回归命令，外置测试已收入 `test/extra/`，输出写入 `build/host-tests/`。不需要登录、网络或 3DS。它验证模拟输入与核心逻辑，不能替代真机、MVD、音频、相册与在线接口验收。
+脚本沿用既有回归命令，并包含 v1.3.9/v1.3.10 新增用例，外置测试已收入 `test/extra/`，输出写入 `build/host-tests/`。不需要登录、网络或 3DS。它验证模拟输入与核心逻辑，不能替代真机、MVD、音频、相册与在线接口验收。
